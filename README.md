@@ -4,7 +4,7 @@ This work explores the application of learning-to-rank methodologies to the prob
 ### Environment creation 
 
 ### TODO: 
-- create file for matching images path and names with artifacts
+- create file for matching images path and names with artifacts - to do 
 - work on sampling considering artifact types
 - keep common part in same file (avoid re-writing some stuff in different points)
 - work on preprocessing - avoid resize, use central crop and then random patch during training 
@@ -15,3 +15,4 @@ This work explores the application of learning-to-rank methodologies to the prob
 - streak - ok (try also limited angles)
 - noise - to check
 - motion - to do 
+
