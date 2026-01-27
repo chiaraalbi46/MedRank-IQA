@@ -1,2 +1,4 @@
 ./runs
 ./SalvataggioPredizioniGtMetriche
+.comet.config
+./RESULTS
