@@ -8,6 +8,7 @@ This work explores the application of learning-to-rank methodologies to the prob
     - stesso random crop per x e x^
     - diverso random crop per x e x^
     - integra caso x^1 vs x^2 invece di solo x vs x^ (con x^1 e x^2 stesso artefatto e livello a meno ogni volta di un parametro diverso per cui possa avere senso un ranking tra le due)
+    - considera diverse normalizzazioni (min, max, windowing soft tissue ...)
 
 - finetuning
     - early stopping (usiamo come validation set le 1000-912 immagini non usate per test con dati bilanciati tra gli artefatti)
@@ -16,6 +17,8 @@ This work explores the application of learning-to-rank methodologies to the prob
     - test sbloccando backbone dopo un tot di epoche ...
 
 - for inference (test del modello finetuned) 30 random patches and compute median (see Rank-IQA paper + https://github.com/YunanZhu/Pytorch-TestRankIQA/blob/main/main.py)
+
+- fai import da EstrazioneIndiciDict.py per la roba degli indici 
 
 - artifact simulation from projections
     - modify the code for starting from projections ... 
