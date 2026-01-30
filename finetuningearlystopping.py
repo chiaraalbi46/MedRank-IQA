@@ -337,6 +337,8 @@ if __name__ == '__main__':
                         help='name (not entire path) of the folder where results for the test are stored. if None, the dest folder name is created from inputs parameters (file_path, n_finetuning).')
 
     parser.add_argument('--device_id', dest="device_id", default='0', help='gpu device id.')
+    parser.add_argument('--finetune-backbone-lr-multiplier', default=None, type=float, help='learning rate multiplier used to finetune the backbone')
+    parser.add_argument('--finetune-backbone-freeze-epochs', default=0, type=float, help='epochs to keep the backbone frozen when finetuning (only used if learning rate multiplier is specified)')
 
     args = parser.parse_args()
 
@@ -419,12 +421,18 @@ if __name__ == '__main__':
     print(f"Trainable parameters: {trainable_params}")
 
     dest_folder_name = f'from_scratch_{train_images}'
+    learning_rate = 1e-5
     if args.file_path is not None:
-        optim = Adam(model.head.parameters(), lr=1e-5, weight_decay=1e-4)
+        optim = Adam(model.head.parameters(), lr=learning_rate, weight_decay=1e-4)
+        if args.finetune_backbone_lr_multiplier is not None:
+            optim_backbone = Adam(model.resnet.parameters(), lr=learning_rate * args.finetune_backbone_lr_multiplier, weight_decay=1e-4)
+        else:
+            optim_backbone = None
         pretrained_model = args.file_path.split('/')[-1].split('.')[0]
         dest_folder_name = f'finetuning_{pretrained_model}_{train_images}'
     else:
-        optim = Adam(model.parameters(), lr=1e-5, weight_decay=1e-4)
+        optim = Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+        optim_backbone = None
 
     criterion = nn.MSELoss()
 
@@ -439,6 +447,10 @@ if __name__ == '__main__':
 
     # scheduler = StepLR(optim, step_size=50, gamma=0.5)
     scheduler = StepLR(optim, step_size=max(1, n_epochs // 3), gamma=0.5)
+    if optim_backbone is not None:
+        scheduler_backbone = StepLR(optim_backbone, step_size=n_epochs//3, gamma=0.5)
+    else:
+        scheduler_backbone = None
     # scheduler = CosineAnnealingLR(optim, T_max=n_epochs)
 
     # COMET
@@ -456,6 +468,8 @@ if __name__ == '__main__':
 
     experiment.set_name(name_exp)  # comet experiment has the same name of the destination folder
     ek = experiment.get_key()
+
+    optim_backbone_freeze = args.finetune_backbone_freeze_epochs
 
     early_stopping_enabled = (val_dataloader_finetuning is not None)
     best_path = os.path.join(dest_folder, "best_model.pth")
@@ -479,11 +493,15 @@ if __name__ == '__main__':
                 x = x.to(device)
                 y = y.to(device)
                 optim.zero_grad()
+                if optim_backbone is not None and epoch >= optim_backbone_freeze:
+                    optim_backbone.zero_grad()
                 y_pred = model(x)
                 loss = criterion(y_pred, y.unsqueeze(1))
                 t.set_postfix(loss=loss.item())
                 loss.backward()
                 optim.step()
+                if optim_backbone is not None and epoch >= optim_backbone_freeze:
+                    optim_backbone.step()
 
                 train_losses.append(loss.item())
                 # writer.add_scalar("train/loss", loss.item(), iteration)
@@ -570,6 +588,8 @@ if __name__ == '__main__':
         experiment.log_metric("pearson", float(pr_corr), step=epoch)
 
         scheduler.step()  # should be every epoch
+        if scheduler_backbone is not None and epoch >= optim_backbone_freeze:
+            scheduler_backbone.step()  # should be every epoch
 
     # test finale sul modello con la migliore validation test
     if os.path.exists(best_path):
