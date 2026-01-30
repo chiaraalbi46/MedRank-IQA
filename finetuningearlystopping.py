@@ -220,27 +220,8 @@ class FineTuningDictDataset(Dataset):
                 # fallback: autodetect
                 x = LoadImage(image_only=True)(p)
 
-            ### TODO: mantieni tutto su gpu
-            # in questo caso ho già le immagini tra 0 e 1 quindi non riscalo ma croppo e basta
-            # metto loop di 30 patches per testing
-
-            # if not isinstance(x, np.ndarray):
-            #     x = np.asarray(x)
-            # x = x.astype(np.float32, copy=False)
-            # x_chlast = ensure_chlast(x)          # (H,W[,C]) -> channel-last
-
-            # x_cd_hw  = chlast_to_cd_hw(x_chlast) # -> (C,S,H,W)
-            # x_cd_hw  = fix_depth_cd_hw(x_cd_hw, TARGET_D)
-
             return x
 
-        # self.transform = Compose([
-        #     Lambda(func=_load_to_cd_hw),
-        #     # BodyCropOtsu(), # H, W
-        #     # ScaleIntensity(minv=0.0, maxv=1.0),
-        #     # Resize((TARGET_HW, TARGET_HW)),
-        #     ToTensor(dtype=torch.float32),  # H, W
-        # ])
         self.load = Lambda(func=_load)
 
     def __len__(self):
@@ -275,7 +256,12 @@ class Step2Model(nn.Module):
     def __init__(self, siamese_model):
         super().__init__()
         self.resnet = siamese_model.resnet
-        self.head = nn.Linear(256, 1)
+        # self.head = nn.Linear(256, 1)
+        self.head = nn.Sequential(
+            nn.Linear(256, 64),  
+            nn.ReLU(),            
+            nn.Linear(64, 1)    
+        )
 
     def forward(self, x):
         z = self.resnet(x)

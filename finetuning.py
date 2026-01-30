@@ -189,7 +189,12 @@ class Step2Model(nn.Module):
     def __init__(self, siamese_model):
         super().__init__()
         self.resnet = siamese_model.resnet 
-        self.head = nn.Linear(256, 1)
+        # self.head = nn.Linear(256, 1)
+        self.head = nn.Sequential(
+            nn.Linear(256, 64),  
+            nn.ReLU(),            
+            nn.Linear(64, 1)    
+        )
 
     def forward(self, x):               
         z = self.resnet(x)
