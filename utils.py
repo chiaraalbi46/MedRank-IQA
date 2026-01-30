@@ -7,6 +7,7 @@ from skimage.filters import threshold_otsu
 from monai.transforms import LoadImage
 import json 
 import os
+import numpy as np 
 
 def get_train_map(base_train_path):
 
@@ -149,14 +150,57 @@ def extract_body_crop_otsu(x, min_size=224):
 
     return cropped, (minr, minc, maxr, maxc), mask
 
-def save_crop_otsu_indices_pretraining(mode):
+def pad_to_target_hw(x, target_hw):
+    h, w = x.shape
+    pad_h = max(0, target_hw - h)
+    pad_w = max(0, target_hw - w)
+
+    pad_top = pad_h // 2
+    pad_bottom = pad_h - pad_top
+    pad_left = pad_w // 2
+    pad_right = pad_w - pad_left
+
+    padded = np.pad(
+        x,
+        ((pad_top, pad_bottom), (pad_left, pad_right)),
+        mode="constant"
+    )
+
+    was_padded = (pad_h > 0) or (pad_w > 0)
+    return padded, was_padded
+
+
+### TODO: add low dose and save images and low dose images in consistent json, maybe best solution
+# is a dataframe image, low dose image and ostu crop ...
+def save_crop_otsu_indices_pretraining(mode, TARGET_HW=224):
     """ Scan train and test images of pretraining dataset (separated) and save indices of Otsu crop in json for each image. """
     # these json should be loaded in pretraining for performing the Otsu crop on gpu instead of on cpu 
 
     root_path=f"/Prove/Albisani/TCIA_datasets/{mode}"
+    jsonl_path = os.path.join('/Prove/Albisani/TCIA_datasets', f"otsu_crops_npy_{mode}.jsonl")
 
-    image_files = []
-    otsu_crops = {}
+    npy_root = os.path.join(
+        "/Prove/Albisani/TCIA_datasets",
+        f"{mode}_cropped_npy"
+    )
+    os.makedirs(npy_root, exist_ok=True)
+
+    # Track already processed images
+    processed_images = set()
+    if os.path.exists(jsonl_path):
+        with open(jsonl_path, "r") as f:
+            for line in f:
+                try:
+                    entry = json.loads(line)
+                    processed_images.update(entry.keys())
+                except json.JSONDecodeError:
+                    continue
+        print(f"Resuming, {len(processed_images)} images already processed.")
+
+    skipped_empty = []
+    skipped_errors = []
+    padded_images = []
+
     for patient_folder in os.listdir(root_path):
         patient_path = os.path.join(root_path, patient_folder)
         if os.path.isdir(patient_path):
@@ -165,26 +209,162 @@ def save_crop_otsu_indices_pretraining(mode):
                 for root, _, files in os.walk(image_dir):
                     for f in files:
                         if f.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tif", ".dcm")):
-                            img_path = os.path.join(root, f)
-                            print(img_path)
-                            image_files.append(img_path)
-                            #### compute Otsu crop 
+                            img_path = os.path.join(root, f)  # full dose 
+
+                            if img_path in processed_images:
+                                continue
                             
-                            im = LoadImage(image_only=True)(img_path)
+                            print("Processing: ", img_path)
 
-                            im_np = im.detach().cpu().numpy()
+                            #### compute Otsu crop 
+                            try:
+                                im = LoadImage(image_only=True)(img_path)
+                                im_np = im.detach().cpu().numpy()
 
-                            # call function
-                            x_out, (minr, minc, maxr, maxc), mask = extract_body_crop_otsu(im_np)
+                                # call function
+                                try:
+                                    x_out, (minr, minc, maxr, maxc), mask = extract_body_crop_otsu(im_np)
+                                    # --- PAD ---
+                                    x_crop_padded, was_padded = pad_to_target_hw(x_out, TARGET_HW)
 
-                            # save json
-                            otsu_crops[img_path] = [int(minr), int(minc), int(maxr), int(maxc)]
+                                    # --- SAVE NPY ---
+                                    # rel_id = img_path.replace("/", "_")
+                                    pat_id =  img_path.split('/')[-3]
+                                    name_im = img_path.split('/')[-1].replace('.dcm', '')
+                                    fd_npy_path = os.path.join(npy_root, f"{pat_id}_{name_im}_fd.npy")
 
-    json_path = os.path.join('/Prove/Albisani/TCIA_datasets', f"otsu_crops_{mode}.json")
-    with open(json_path, "w") as f:
-        json.dump(otsu_crops, f, indent=2)
+                                    np.save(fd_npy_path, x_crop_padded.astype(np.float32))
 
-    print(f"Saved Otsu crop boxes for {len(otsu_crops)} images to {json_path}")
+                                except Exception as e:
+                                    print(f"Failed to extract body crop for {img_path}, skipping. Error: {e}")
+                                    skipped_errors.append(img_path)
+                                    continue
+
+                                # consider low dose path
+                                low_dose_path = img_path.replace("Full_Dose_Images", "Low_Dose_Images")
+                                ld_im = LoadImage(image_only=True)(low_dose_path)
+                                ld_np = ld_im.detach().cpu().numpy()
+                                ld_crop = ld_np[minr:maxr, minc:maxc]
+                                ld_crop, _ = pad_to_target_hw(ld_crop, TARGET_HW)
+
+                                ld_npy_path = os.path.join(npy_root, f"{pat_id}_{name_im}_ld.npy")
+                                np.save(ld_npy_path, ld_crop.astype(np.float32))
+
+                                # entry = {
+                                #     "full_dose_path": img_path,
+                                #     "low_dose_path": low_dose_path,
+                                #     "crop": [int(minr), int(minc), int(maxr), int(maxc)]
+                                # }
+                                entry = {
+                                    "full_dose_path": img_path,
+                                    "low_dose_path": low_dose_path,
+                                    "full_dose_npy": fd_npy_path,
+                                    "low_dose_npy": ld_npy_path,
+                                    "crop": [int(minr), int(minc), int(maxr), int(maxc)],
+                                    "was_padded": was_padded,
+                                    # "target_hw": TARGET_HW
+                                }
+
+                                with open(jsonl_path, "a") as f_jsonl:
+                                    f_jsonl.write(json.dumps(entry) + "\n")
+                                
+                                processed_images.add(img_path)
+                                if was_padded:
+                                    padded_images.append(img_path)
+
+                            except Exception as e:
+                                print(f"Error processing {img_path}: {e}")
+                                skipped_errors.append(img_path)
+                                continue
+
+    # json_path = os.path.join('/Prove/Albisani/TCIA_datasets', f"otsu_crops_{mode}.json")
+    # with open(json_path, "w") as f:
+    #     json.dump(otsu_crops, f, indent=2)
+
+    # print(f"Saved Otsu crop boxes for {len(otsu_crops)} images to {json_path}")
+    print(f"Processing complete. Crops saved incrementally in {jsonl_path}")
+    print(f"Skipped empty slices: {len(skipped_empty)}")
+    print(f"Skipped errors: {len(skipped_errors)}")
+    print(f"Processed images: {len(processed_images)}")
+    print(f"Padded images: {len(padded_images)}")
+
+
+# def save_crop_otsu_indices_pretraining(mode):
+#     """ Scan train and test images of pretraining dataset (separated) and save indices of Otsu crop in json for each image. """
+#     # these json should be loaded in pretraining for performing the Otsu crop on gpu instead of on cpu 
+
+#     root_path=f"/Prove/Albisani/TCIA_datasets/{mode}"
+#     jsonl_path = os.path.join('/Prove/Albisani/TCIA_datasets', f"otsu_crops_{mode}.jsonl")
+
+#     # Track already processed images
+#     processed_images = set()
+#     if os.path.exists(jsonl_path):
+#         with open(jsonl_path, "r") as f:
+#             for line in f:
+#                 try:
+#                     entry = json.loads(line)
+#                     processed_images.update(entry.keys())
+#                 except json.JSONDecodeError:
+#                     continue
+#         print(f"Resuming, {len(processed_images)} images already processed.")
+
+#     # image_files = []
+#     # otsu_crops = {}
+#     skipped_empty = []
+#     skipped_errors = []
+
+#     for patient_folder in os.listdir(root_path):
+#         patient_path = os.path.join(root_path, patient_folder)
+#         if os.path.isdir(patient_path):
+#             image_dir = os.path.join(patient_path, "Full_Dose_Images")
+#             if os.path.isdir(image_dir):
+#                 for root, _, files in os.walk(image_dir):
+#                     for f in files:
+#                         if f.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tif", ".dcm")):
+#                             img_path = os.path.join(root, f)
+
+#                             if img_path in processed_images:
+#                                 continue
+                            
+#                             print("Processing: ", img_path)
+
+#                             #### compute Otsu crop 
+#                             try:
+#                                 im = LoadImage(image_only=True)(img_path)
+#                                 im_np = im.detach().cpu().numpy()
+
+#                                 # call function
+#                                 try:
+#                                     x_out, (minr, minc, maxr, maxc), mask = extract_body_crop_otsu(im_np)
+#                                 except Exception as e:
+#                                     print(f"Failed to extract body crop for {img_path}, skipping. Error: {e}")
+#                                     skipped_errors.append(img_path)
+#                                     continue
+
+#                                 entry = {img_path: [int(minr), int(minc), int(maxr), int(maxc)]}
+
+#                                 with open(jsonl_path, "a") as f_jsonl:
+#                                     f_jsonl.write(json.dumps(entry) + "\n")
+                                
+#                                 processed_images.add(img_path)
+
+#                                 # # save json
+#                                 # otsu_crops[img_path] = [int(minr), int(minc), int(maxr), int(maxc)]
+#                                 # image_files.append(img_path)  # tengo solo le immagini non tutte nere
+
+#                             except Exception as e:
+#                                 print(f"Error processing {img_path}: {e}")
+#                                 skipped_errors.append(img_path)
+#                                 continue
+
+#     # json_path = os.path.join('/Prove/Albisani/TCIA_datasets', f"otsu_crops_{mode}.json")
+#     # with open(json_path, "w") as f:
+#     #     json.dump(otsu_crops, f, indent=2)
+
+#     # print(f"Saved Otsu crop boxes for {len(otsu_crops)} images to {json_path}")
+#     print(f"Processing complete. Crops saved incrementally in {jsonl_path}")
+#     print(f"Skipped empty slices: {len(skipped_empty)}")
+#     print(f"Skipped errors: {len(skipped_errors)}")
 
 
 
@@ -233,36 +413,51 @@ def save_crop_otsu_indices_finetuning(mode):
 if __name__ == "__main__":
     import pandas as pd
 
-    ############################# train
-    base_train_path = '/Prove/Albisani/LDCTIQA_dataset/LDCTIQAG2023_train'
+    mode = 'test'
+    save_crop_otsu_indices_pretraining(mode)
+    ## 
+    # processed_images = set()
+    # with open(f'/Prove/Albisani/TCIA_datasets/otsu_crops_{mode}.jsonl', "r") as f:
+    #     for line in f:
+    #         try:
+    #             entry = json.loads(line)
+    #             processed_images.update(entry.keys())
+    #         except json.JSONDecodeError:
+    #             continue
+    # print(len(processed_images))
+    # pass
+
+
+    # ########################### train
+    # base_train_path = '/Prove/Albisani/LDCTIQA_dataset/LDCTIQAG2023_train'
 
     # get_train_map(base_train_path)
 
-    map_file = os.path.join(base_train_path, 'train_map.csv')
-    df_train = pd.read_csv(map_file, index_col=0)
+    # map_file = os.path.join(base_train_path, 'train_map.csv')
+    # df_train = pd.read_csv(map_file, index_col=0)
 
-    image_score_dict_train = dict(zip(df_train['image_filepath'], df_train['score']))  # this create exactly same dict as build_path_score_dict
+    # image_score_dict_train = dict(zip(df_train['image_filepath'], df_train['score']))  # this create exactly same dict as build_path_score_dict
 
-    train_images_root = "/Prove/Albisani/LDCTIQA_dataset/LDCTIQAG2023_train/image"
-    train_json        = "/Prove/Albisani/LDCTIQA_dataset/LDCTIQAG2023_train/train.json"
-    train_dict = build_path_score_dict(train_json, train_images_root, is_test=False)
+    # train_images_root = "/Prove/Albisani/LDCTIQA_dataset/LDCTIQAG2023_train/image"
+    # train_json        = "/Prove/Albisani/LDCTIQA_dataset/LDCTIQAG2023_train/train.json"
+    # train_dict = build_path_score_dict(train_json, train_images_root, is_test=False)
 
-    if dicts_equal_float(image_score_dict_train, train_dict, tol=1e-9):
-        print("train dictionary is ok ")
+    # if dicts_equal_float(image_score_dict_train, train_dict, tol=1e-9):
+    #     print("train dictionary is ok ")
 
-    ############################# test 
-    base_test_path = '/Prove/Albisani/LDCTIQA_dataset/LDCTIQAC2023_test'
+    # ########################### test 
+    # base_test_path = '/Prove/Albisani/LDCTIQA_dataset/LDCTIQAC2023_test'
 
     # get_test_map(base_test_path)
 
-    map_file_test = os.path.join(base_test_path, 'test_map.csv')
-    df_test = pd.read_csv(map_file_test, index_col=0)
+    # map_file_test = os.path.join(base_test_path, 'test_map.csv')
+    # df_test = pd.read_csv(map_file_test, index_col=0)
 
-    image_score_dict_test = dict(zip(df_test['image_filepath'], df_test['score'])) 
+    # image_score_dict_test = dict(zip(df_test['image_filepath'], df_test['score'])) 
 
-    test_images_root  = "/Prove/Albisani/LDCTIQA_dataset/LDCTIQAC2023_test"
-    test_json         = "/Prove/Albisani/LDCTIQA_dataset/LDCTIQAC2023_test/test-ground-truth.json"
-    test_dict  = build_path_score_dict(test_json, test_images_root, is_test=True)
+    # test_images_root  = "/Prove/Albisani/LDCTIQA_dataset/LDCTIQAC2023_test"
+    # test_json         = "/Prove/Albisani/LDCTIQA_dataset/LDCTIQAC2023_test/test-ground-truth.json"
+    # test_dict  = build_path_score_dict(test_json, test_images_root, is_test=True)
 
-    if dicts_equal_float(image_score_dict_test, test_dict, tol=1e-9):
-        print("test dictionary is ok ")
+    # if dicts_equal_float(image_score_dict_test, test_dict, tol=1e-9):
+    #     print("test dictionary is ok ")

@@ -9,6 +9,10 @@ This work explores the application of learning-to-rank methodologies to the prob
     - diverso random crop per x e x^
     - integra caso x^1 vs x^2 invece di solo x vs x^ (con x^1 e x^2 stesso artefatto e livello a meno ogni volta di un parametro diverso per cui possa avere senso un ranking tra le due)
     - considera diverse normalizzazioni (min, max, windowing soft tissue ...)
+    - aggiungi pazienti da TCIA (nb: rifai otsu crop json su nuovi dati)
+    - usare le low dose images come versioni 'perturbate' ?
+
+    - **fai salvataggio offline in npy delle immagini con otsu crop + modifica funzione per essere sicuri che abbia 224x224 - potrebbero esserci immagini più piccole (check)-dovrebbe velocizzare**
 
 - finetuning
     - early stopping (usiamo come validation set le 1000-912 immagini non usate per test con dati bilanciati tra gli artefatti)
