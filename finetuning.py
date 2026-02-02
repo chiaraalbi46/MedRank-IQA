@@ -301,9 +301,9 @@ if __name__ == '__main__':
     # Step 2 fine-tuning 
     model = Step2Model(model)
     model = model.to(device)
-    if args.file_path is not None:
-        for p in model.resnet.parameters():
-            p.requires_grad = False
+    # if args.file_path is not None:
+    #     for p in model.resnet.parameters():
+    #         p.requires_grad = False
 
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Trainable parameters: {trainable_params}")
@@ -316,11 +316,17 @@ if __name__ == '__main__':
             optim_backbone = Adam(model.resnet.parameters(), lr=learning_rate * args.finetune_backbone_lr_multiplier, weight_decay=1e-4)
         else:
             optim_backbone = None
+            if args.file_path is not None:
+                for p in model.resnet.parameters():
+                    p.requires_grad = False
         pretrained_model = args.file_path.split('/')[-1].split('.')[0]
         dest_folder_name = f'finetuning_{pretrained_model}_{train_images}'
     else:
         optim = Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
         optim_backbone = None
+        if args.file_path is not None:
+            for p in model.resnet.parameters():
+                p.requires_grad = False
         
     criterion = nn.MSELoss()
 
@@ -372,7 +378,7 @@ if __name__ == '__main__':
                 if optim_backbone is not None and epoch >= optim_backbone_freeze:
                     optim_backbone.zero_grad()
                 y_pred = model(x)
-                y_pred = torch.clamp(y_pred, 0, 4)  # gt scores are between 0 and 4
+                # y_pred = torch.clamp(y_pred, 0, 4)  # gt scores are between 0 and 4
                 loss = criterion(y_pred, y.unsqueeze(1))
                 t.set_postfix(loss=loss.item())
                 loss.backward()
@@ -409,6 +415,7 @@ if __name__ == '__main__':
                     test_losses.append(loss.item())
 
                     # Salva pred/gt nello stesso ordine
+                    y_pred = torch.clamp(y_pred, 0, 4)
                     all_predictions.append(y_pred.squeeze(1).cpu().numpy())  
                     all_targets.append(y.cpu().numpy())                    
 

@@ -21,7 +21,7 @@ from torch.utils.tensorboard import SummaryWriter
 import torch.nn.functional as F
 from scipy.stats import spearmanr, kendalltau, pearsonr
 
-from pretraining import TARGET_HW, SiameseModel, random_patch_selection
+from pretraining import TARGET_HW, random_patch_selection, SiameseModel
 from utils import build_path_score_dict  # TODO: with the new csv files this function maybe should be avoided...
 
 
@@ -283,7 +283,6 @@ def evaluate_loss(model, dataloader, device, criterion) -> float:
             losses.append(loss.item())
     return float(np.mean(losses)) if len(losses) else float("inf")
 
-
 if __name__ == '__main__':
 
     ###### NB: per ogni test viene creata una cartella con questa struttura a meno che non si passi --dest_folder:
@@ -328,7 +327,6 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    # device = "cuda:0"
     device = torch.device(f'cuda:{args.device_id}' if torch.cuda.is_available() else 'cpu')
 
     n_epochs = int(args.n_epochs)
@@ -448,9 +446,9 @@ if __name__ == '__main__':
             project_name=args.name_proj
         )
     else:
-        # experiment = Experiment(project_name=args.name_proj)
+        experiment = Experiment(project_name=args.name_proj)
         # if .comet.config is not correctly loaded pass explicitly your COMET_API_KEY
-        experiment = Experiment(project_name=args.name_proj, api_key='Fwcd8Z62iWdyhdkt7y0gYSVQw')
+        # experiment = Experiment(project_name=args.name_proj, api_key='Fwcd8Z62iWdyhdkt7y0gYSVQw')
 
     experiment.set_name(name_exp)  # comet experiment has the same name of the destination folder
     ek = experiment.get_key()
@@ -464,7 +462,7 @@ if __name__ == '__main__':
     early_stopper = None
     if early_stopping_enabled:
         early_stopper = EarlyStopping(
-            patience=4, #10, 20
+            patience=5, #10, 20
             verbose=True,
             delta=1e-4,
             path=best_path,
@@ -542,6 +540,7 @@ if __name__ == '__main__':
                 test_losses.append(loss.item())
 
                 # Salva pred/gt nello stesso ordine
+                y_pred = torch.clamp(y_pred, 0, 4)
                 all_predictions.append(y_pred.squeeze(1).cpu().numpy())
                 all_targets.append(y.cpu().numpy())
 
@@ -600,6 +599,7 @@ if __name__ == '__main__':
             t.set_postfix(loss=loss.item())
             test_losses.append(loss.item())
 
+            y_pred = torch.clamp(y_pred, 0, 4)
             all_predictions.append(y_pred.squeeze(1).cpu().numpy())
             all_targets.append(y.cpu().numpy())
             all_names.extend([os.path.basename(p) for p in paths])
