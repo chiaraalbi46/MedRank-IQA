@@ -297,12 +297,13 @@ if __name__ == '__main__':
     # python finetuning.py --file_path './pretrained_models/soft_tissue_window.pth' --> i risultati sono salvati in ./RESULTS/finetuning_soft_tissue_window_all [finetuning (sì pretraining) all train images]
     # python finetuning.py --n_finetuning 12 --dest_folder 'prova'  --> i risultati sono salvati in ./RESULTS/prova [finetuning 12 img ma con nome cartella 'libero']
 
+
     parser = ArgumentParser()
-    parser.add_argument('--n_finetuning', dest="n_finetuning", type=int, nargs='?', default=None,
+    parser.add_argument('--n_finetuning', dest="n_finetuning", type=int, nargs='?', default=912,
                         help="number of images for training (from scratch or finetuning). if None use all images of the train set.")
     # serve per usare un minor numero di immagini del dataset di finetuning
 
-    parser.add_argument('sampling_json', nargs='?', default='./sampling_dict_12_48_240_612_seed42.json',
+    parser.add_argument('sampling_json', nargs='?', default='/data/lesc/users/agnoloni/Tesi/MedRank-IQA/sampling_dict_12_48_240_612_seed42.json',
                         help="path to sampling indices json file. sampling_dict_12_48_240_612_*.json")
 
     parser.add_argument('--file_path', dest="file_path", nargs='?', default=None,
@@ -312,26 +313,32 @@ if __name__ == '__main__':
 
     # comet parameters
     parser.add_argument("--comet", dest="comet", default=1, help="1 for comet ON, 0 for comet OFF")
-    parser.add_argument("--name_proj", dest="name_proj", default='medrank-iqa-finetuning', help="define comet ml project folder")
+    parser.add_argument("--name_proj", dest="name_proj", default='medrank-iqa-finetuning-smaller-batch-size', help="define comet ml project folder")
     # parser.add_argument("--name_exp", dest="name_exp", default='soft_tissue_window', help="name of comet ml experiment")
 
-    parser.add_argument("--batch_size", dest="batch_size", default=32, help="batch size for train and test")
+    parser.add_argument("--batch_size", dest="batch_size", default=16, help="batch size for train and test")
     parser.add_argument('--n_epochs', dest="n_epochs", type=int, default=100, help='number of epochs for training')
 
-    parser.add_argument('--dest_folder', dest="dest_folder", default=None,
+    parser.add_argument('--dest_folder', dest="dest_folder", default='debugging_from_scratch_912',
                         help='name (not entire path) of the folder where results for the test are stored. if None, the dest folder name is created from inputs parameters (file_path, n_finetuning).')
 
     parser.add_argument('--device_id', dest="device_id", default='0', help='gpu device id.')
     parser.add_argument('--finetune-backbone-lr-multiplier', default=None, type=float, help='learning rate multiplier used to finetune the backbone')
     parser.add_argument('--finetune-backbone-freeze-epochs', default=0, type=float, help='epochs to keep the backbone frozen when finetuning (only used if learning rate multiplier is specified)')
 
-    args = parser.parse_args()
+    parser.add_argument("--learning_rate", dest="learning_rate", type=float, default=1e-5,
+                    help="base learning rate")
+    
+    parser.add_argument("--patience", dest="patience", type=int, default=10,
+                    help="early stopping patience (used only if validation is enabled)")
 
+    args = parser.parse_args()
+    
     device = torch.device(f'cuda:{args.device_id}' if torch.cuda.is_available() else 'cpu')
 
     n_epochs = int(args.n_epochs)
 
-    base_finetuned_folder = './RESULTS'  # where test subfolders are stored
+    base_finetuned_folder = './RESULTS_new_batch'  # where test subfolders are stored
 
     train_images_root = "/Prove/Albisani/LDCTIQA_dataset/LDCTIQAG2023_train/image"
     train_json = "/Prove/Albisani/LDCTIQA_dataset/LDCTIQAG2023_train/train.json"
@@ -405,7 +412,7 @@ if __name__ == '__main__':
     print(f"Trainable parameters: {trainable_params}")
 
     dest_folder_name = f'from_scratch_{train_images}'
-    learning_rate = 1e-5
+    learning_rate = float(args.learning_rate)
     if args.file_path is not None:
         optim = Adam(model.head.parameters(), lr=learning_rate, weight_decay=1e-4)
         if args.finetune_backbone_lr_multiplier is not None:
@@ -436,6 +443,7 @@ if __name__ == '__main__':
     else:
         scheduler_backbone = None
     # scheduler = CosineAnnealingLR(optim, T_max=n_epochs)
+    
 
     # COMET
     experiment = None
@@ -446,23 +454,33 @@ if __name__ == '__main__':
             project_name=args.name_proj
         )
     else:
-        experiment = Experiment(project_name=args.name_proj)
+        # experiment = Experiment(project_name=args.name_proj)
         # if .comet.config is not correctly loaded pass explicitly your COMET_API_KEY
-        # experiment = Experiment(project_name=args.name_proj, api_key='Fwcd8Z62iWdyhdkt7y0gYSVQw')
+        experiment = Experiment(project_name=args.name_proj, api_key='Fwcd8Z62iWdyhdkt7y0gYSVQw')
 
     experiment.set_name(name_exp)  # comet experiment has the same name of the destination folder
     ek = experiment.get_key()
 
-    optim_backbone_freeze = args.finetune_backbone_freeze_epochs
+    experiment.log_parameters({
+        "learning_rate": float(learning_rate),
+        "patience": int(args.patience),
+        "finetune_backbone_lr_multiplier": None if args.finetune_backbone_lr_multiplier is None else float(args.finetune_backbone_lr_multiplier),
+        "finetune_backbone_freeze_epochs": float(args.finetune_backbone_freeze_epochs),
+        "batch_size": int(args.batch_size),
+        "n_epochs": int(args.n_epochs),
+        "n_finetuning": None if args.n_finetuning is None else int(args.n_finetuning),
+        "pretrained_file_path": None if args.file_path is None else str(args.file_path),
+    })
+
+    optim_backbone_freeze = float(args.finetune_backbone_freeze_epochs)
 
     early_stopping_enabled = (val_dataloader_finetuning is not None)
     best_path = os.path.join(dest_folder, "best_model.pth")
-    best_epoch_file = os.path.join(dest_folder, "best_epoch.txt")
 
     early_stopper = None
     if early_stopping_enabled:
         early_stopper = EarlyStopping(
-            patience=5, #10, 20
+            patience=int(args.patience),
             verbose=True,
             delta=1e-4,
             path=best_path,
@@ -504,11 +522,6 @@ if __name__ == '__main__':
             )
 
             early_stopper(val_loss_mean, model, epoch_1based=epoch + 1)
-
-            # salva epoca con miglior validation loss
-            if early_stopper.best_epoch is not None:
-                with open(best_epoch_file, "w", encoding="utf-8") as f:
-                    f.write(str(early_stopper.best_epoch))
 
             if early_stopper.early_stop:
                 print(

@@ -868,8 +868,10 @@ if __name__ == '__main__':
     parser.add_argument("--name_exp", dest="name_exp", default='soft_tissue_window', help="name of comet ml experiment")
 
     parser.add_argument("--batch_size", dest="batch_size", default=16, help="batch size for train and test")
+    # TODO: aggiungi patience as argument
+    # log hyperparametri (lr, patience, lr backbone, )
 
-    parser.add_argument('--device_id', dest="device_id",  default='0', help='gpu device id.')
+    parser.add_argument('--device_id', dest="device_id",  default='1', help='gpu device id.')
 
     args = parser.parse_args()
 
