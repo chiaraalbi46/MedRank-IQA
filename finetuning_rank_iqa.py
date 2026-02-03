@@ -1,28 +1,34 @@
-""" This code aims to refactoring the finetuning code (CodiceFase2Shallow_SavePredictionsDict_Metriche_json.py), also introducing a different way for evaluating 
-results based on multiple crops. """
+""" This code reproduces finetuning with vgg16 as in Rank-IQA paper """
 
 from comet_ml import Experiment, OfflineExperiment
-
-from argparse import ArgumentParser
-from torch.optim.lr_scheduler import StepLR, CosineAnnealingLR
-import torch
-import numpy as np
-import random
-import os
-import json
-import pandas as pd
-from torch import nn
 from torch.optim import Adam
 from torch.utils.data import Dataset, DataLoader
-from monai.transforms import LoadImage, Compose, ToTensor, Lambda
-from monai.data.image_reader import PydicomReader
+from argparse import ArgumentParser
+import torch
+from torch import nn
+import numpy as np 
+import os 
 from tqdm.auto import tqdm
-from torch.utils.tensorboard import SummaryWriter
-import torch.nn.functional as F
+import pandas as pd
+import json
+from monai.transforms import LoadImage, Lambda
+from monai.data.image_reader import PydicomReader
+import random
+from random import randrange
+from torch.optim.lr_scheduler import StepLR
 from scipy.stats import spearmanr, kendalltau, pearsonr
+from pretraining_rank_iqa import RankIQA_branch, Vgg16
 
-from pretraining import TARGET_HW, SiameseModel, random_patch_selection
 from utils import build_path_score_dict # TODO: with the new csv files this function maybe should be avoided...
+ 
+TARGET_HW = 224
+
+def random_patch_selection(h, w, crop_size=TARGET_HW):
+
+    top = randrange(0, max(1, h - crop_size))
+    left = randrange(0, max(1, w - crop_size))
+
+    return top, left
 
 # Sampling JSON helpers 
 def load_sampling_dict(sampling_json_path: str) -> dict[int, list[int]]:
@@ -92,7 +98,6 @@ def indices_to_train_paths(train_map_csv: str, images_root: str, selected_indice
         paths.append(img_path)
 
     return paths
-
 
 def subset_path_score_dict_by_paths(path_score_dict: dict[str, float], keep_paths: list[str]) -> dict[str, float]:
     out = {}
@@ -165,23 +170,6 @@ class FineTuningDictDataset(Dataset):
         else:
             return image_crop, label
 
-class Step2Model(nn.Module):
-    def __init__(self, siamese_model):
-        super().__init__()
-        self.resnet = siamese_model.resnet 
-        # self.head = nn.Linear(256, 1)
-        self.head = nn.Sequential(
-            nn.Linear(256, 64),  
-            nn.ReLU(),            
-            nn.Linear(64, 1)    
-        )
-
-    def forward(self, x):               
-        z = self.resnet(x)
-        # y_pred = torch.sigmoid(self.head(z)) * 4  # gli score sono tra 0 e 4 
-        y_pred = self.head(z)  # no activation
-        return y_pred
-    
 if __name__ == '__main__':
 
     ###### NB: per ogni test viene creata una cartella con questa struttura a meno che non si passi --dest_folder:
@@ -204,7 +192,7 @@ if __name__ == '__main__':
     parser.add_argument('sampling_json', nargs='?', default='./sampling_dict_12_48_240_612_seed42.json',
                     help="path to sampling indices json file. sampling_dict_12_48_240_612_*.json")
     
-    parser.add_argument('--file_path', dest="file_path", nargs='?', default=None,
+    parser.add_argument('--file_path', dest="file_path", nargs='?', default='./Pytorch_TestRankIQA_pretrained/Rank_tid2013.caffemodel.pt',
                         help="path to the pretrained model (phase 1). if None the model is trained from scratch.") #se nella riga di comando sul terminale non ci metto niente, lui non 
     #carica niente cioè non carica il modello con i pesi salvati, se ci scrivo il nome del file con i pesi salvati invece li carica 
     
@@ -225,6 +213,9 @@ if __name__ == '__main__':
     
     parser.add_argument("--learning_rate", dest="learning_rate", type=float, default=1e-5, help="base learning rate")
 
+    parser.add_argument('--imagenet-initialization', dest="imagenet-initialization",  default=None, help='use (1) or not (None) imagenet weights for VGG16')
+     # '/data/lesc/staff/albisani/MedRank-IQA/Pytorch_TestRankIQA_pretrained/Rank_tid2013.caffemodel.pt'
+
     args = parser.parse_args()
 
     # device = "cuda:0"
@@ -232,7 +223,8 @@ if __name__ == '__main__':
 
     n_epochs = int(args.n_epochs)
 
-    base_finetuned_folder = './RESULTS'  ### where test subfolders are stored
+    base_finetuned_folder = './RESULTS_VGG_PRETRAINED'  ### where test subfolders are stored
+    os.makedirs(base_finetuned_folder, exist_ok=True)
 
     train_images_root = "/Prove/Albisani/LDCTIQA_dataset/LDCTIQAG2023_train/image"
     train_json        = "/Prove/Albisani/LDCTIQA_dataset/LDCTIQAG2023_train/train.json"
@@ -273,18 +265,41 @@ if __name__ == '__main__':
     train_dataloader_finetuning = DataLoader(dataset=train_dataset_finetuning, batch_size=int(args.batch_size), shuffle=True)
     test_dataloader_finetuning  = DataLoader(dataset=test_dataset_finetuning,  batch_size=int(args.batch_size))
 
-    # Caricamento o meno dei pesi preaddestrati della fase 1
-    model = SiameseModel()
-    if args.file_path is not None:
-        print("Loading weights")
-        model.load_state_dict(torch.load(args.file_path, weights_only=True))
+    # # Caricamento o meno dei pesi preaddestrati della fase 1
+    # model = SiameseModel()
+    # if args.file_path is not None:
+    #     print("Loading weights")
+    #     model.load_state_dict(torch.load(args.file_path, weights_only=True))
 
-    # Step 2 fine-tuning 
-    model = Step2Model(model)
-    model = model.to(device)
+    # # Step 2 fine-tuning 
+    # model = Step2Model(model)
+    # model = model.to(device)
     # if args.file_path is not None:
     #     for p in model.resnet.parameters():
     #         p.requires_grad = False
+
+    if args.file_path is not None:  # questo quando carico pretrained su img naturali 
+        if 'Pytorch_TestRankIQA_pretrained' in args.file_path:
+            print("Load Rank-IQA weights")
+            vgg = Vgg16(imagenet=None)
+            vgg.load_model(args.file_path, debug=True)
+
+            model = RankIQA_branch(vgg_model=vgg).to(device)
+
+        else:
+            print("Load our pretrained weights")
+            ## questo quando carico con modello pretrained su ct (siamese)
+            vgg = Vgg16(imagenet=args.imagenet_initialization)
+            model = RankIQA_branch(vgg_model=vgg).to(device)
+
+            state_dict = torch.load(args.file_path, map_location=device)
+            # model.load_state_dict(state_dict, strict=True)
+            scorer_state_dict = {
+                    k.replace("scorer.", ""): v
+                    for k, v in state_dict.items()
+                    if k.startswith("scorer.")
+                }
+            model.load_state_dict(scorer_state_dict, strict=True)
 
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Trainable parameters: {trainable_params}")
@@ -294,12 +309,10 @@ if __name__ == '__main__':
     if args.file_path is not None:
         optim = Adam(model.head.parameters(), lr=learning_rate, weight_decay=1e-4)
         if args.finetune_backbone_lr_multiplier is not None:
-            optim_backbone = Adam(model.resnet.parameters(), lr=learning_rate * args.finetune_backbone_lr_multiplier, weight_decay=1e-4)
+            # optim_backbone = Adam(model.resnet.parameters(), lr=learning_rate * args.finetune_backbone_lr_multiplier, weight_decay=1e-4)
+            optim_backbone = Adam(model.features.parameters(), lr=learning_rate * args.finetune_backbone_lr_multiplier, weight_decay=1e-4)
         else:
             optim_backbone = None
-            if args.file_path is not None:
-                for p in model.resnet.parameters():
-                    p.requires_grad = False
         pretrained_model = args.file_path.split('/')[-1].split('.')[0]
         dest_folder_name = f'finetuning_{pretrained_model}_{train_images}'
     else:
@@ -317,7 +330,6 @@ if __name__ == '__main__':
     os.makedirs(dest_folder, exist_ok=True)
     print("Destination folder: ", dest_folder)
 
-    # scheduler = StepLR(optim, step_size=50, gamma=0.5)
     scheduler = StepLR(optim, step_size=n_epochs//3, gamma=0.5)
     if optim_backbone is not None:
         scheduler_backbone = StepLR(optim_backbone, step_size=n_epochs//3, gamma=0.5)
@@ -340,17 +352,6 @@ if __name__ == '__main__':
     experiment.set_name(name_exp)  # comet experiment has the same name of the destination folder
     ek = experiment.get_key()
 
-    experiment.log_parameters({
-        "learning_rate": float(learning_rate),
-        "patience": int(args.patience),
-        "finetune_backbone_lr_multiplier": None if args.finetune_backbone_lr_multiplier is None else float(args.finetune_backbone_lr_multiplier),
-        "finetune_backbone_freeze_epochs": float(args.finetune_backbone_freeze_epochs),
-        "batch_size": int(args.batch_size),
-        "n_epochs": int(args.n_epochs),
-        "n_finetuning": None if args.n_finetuning is None else int(args.n_finetuning),
-        "pretrained_file_path": None if args.file_path is None else str(args.file_path),
-    })
-
     optim_backbone_freeze = args.finetune_backbone_freeze_epochs
 
     for epoch in tqdm(range(n_epochs)):
@@ -360,6 +361,10 @@ if __name__ == '__main__':
             for x, y in t:
                 x = x.to(device)
                 y = y.to(device)
+
+                if x.size(1) == 1:
+                    x = x.repeat(1, 3, 1, 1)
+
                 optim.zero_grad()
                 if optim_backbone is not None and epoch >= optim_backbone_freeze:
                     optim_backbone.zero_grad()
@@ -391,6 +396,9 @@ if __name__ == '__main__':
                     x = x.to(device)
                     y = y.to(device)
 
+                    if x.size(1) == 1:
+                        x = x.repeat(1, 3, 1, 1)
+
                     with torch.no_grad():
                         y_pred = model(x)
 
@@ -399,7 +407,7 @@ if __name__ == '__main__':
                     test_losses.append(loss.item())
 
                     # Salva pred/gt nello stesso ordine
-                    y_pred = torch.clamp(y_pred, 0, 4)
+                    y_pred = torch.clamp(y_pred, 0, 4)  # gt scores are between 0 and 4
                     all_predictions.append(y_pred.squeeze(1).cpu().numpy())  
                     all_targets.append(y.cpu().numpy())                    
 
@@ -438,9 +446,6 @@ if __name__ == '__main__':
 
                 with open(os.path.join(dest_folder, "predictions_finetuning_dict.json"), "w", encoding="utf-8") as f:
                     json.dump(pred_dict, f, ensure_ascii=False, indent=2)
-
-                # with open(os.path.join(args.dest_folder, "targets_finetuning_dict.json"), "w", encoding="utf-8") as f:
-                #     json.dump(gt_dict, f, ensure_ascii=False, indent=2)
 
                 # metriche
                 metrics = {

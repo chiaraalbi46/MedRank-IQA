@@ -404,27 +404,32 @@ if __name__ == '__main__':
     # Step 2 fine-tuning
     model = Step2Model(model)
     model = model.to(device)
-    if args.file_path is not None:
-        for p in model.resnet.parameters():
-            p.requires_grad = False
+    # if args.file_path is not None:
+    #     for p in model.resnet.parameters():
+    #         p.requires_grad = False
 
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Trainable parameters: {trainable_params}")
 
     dest_folder_name = f'from_scratch_{train_images}'
+
     learning_rate = float(args.learning_rate)
+
     if args.file_path is not None:
         optim = Adam(model.head.parameters(), lr=learning_rate, weight_decay=1e-4)
         if args.finetune_backbone_lr_multiplier is not None:
             optim_backbone = Adam(model.resnet.parameters(), lr=learning_rate * args.finetune_backbone_lr_multiplier, weight_decay=1e-4)
         else:
             optim_backbone = None
+            if args.file_path is not None:
+                for p in model.resnet.parameters():
+                    p.requires_grad = False
         pretrained_model = args.file_path.split('/')[-1].split('.')[0]
         dest_folder_name = f'finetuning_{pretrained_model}_{train_images}'
     else:
         optim = Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
         optim_backbone = None
-
+    
     criterion = nn.MSELoss()
 
     dest_folder = os.path.join(base_finetuned_folder, dest_folder_name)

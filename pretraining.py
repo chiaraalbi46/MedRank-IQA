@@ -1,5 +1,6 @@
 """ This code aims to refactoring the pretraining code (CodiceFase1Shallow.py), also introducing a different pre-processing step 
 (custom crop instead of resize) and working on random crops instead of on full resized images. """
+
 from comet_ml import Experiment, OfflineExperiment
 
 from argparse import ArgumentParser
@@ -7,12 +8,9 @@ import torch
 import numpy as np
 import random
 import os
-import json
 from torch import nn
 from torch.optim import Adam
 from torch.utils.data import Dataset, DataLoader
-from monai.transforms import LoadImage, Compose, ToTensor, EnsureType, EnsureChannelFirst
-from monai.data.image_reader import PydicomReader
 from tqdm.auto import tqdm
 from dicaugment import Sharpen, RandomBrightnessContrast, GaussNoise
 import torch.nn.functional as F
@@ -21,89 +19,7 @@ from monai.transforms import Transform
 from random import randrange
 import glob
 
-
-# DEVICE = "cuda:0"
 TARGET_HW = 224
-
-# resize dopo load ? non altero l'artefatto ...
-# random crops devono essere stessa posizione (se uso artefatti 'realistici') perchè gli artefatti di ct non sono uniformi 
-# random crops anche diversa posizione se uso gli artefatti che proviamo adesso...
-
-# def extract_body_crop_otsu(x, min_size=224):
-#     # Otsu separates body from background even if not true air
-#     # x = x.detach().cpu().numpy()
-
-#     t = threshold_otsu(x)
-#     mask = x > t
-
-#     # Clean
-#     mask = closing(mask, disk(7))
-
-#     # Largest connected component
-#     labeled = label(mask)
-#     regions = regionprops(labeled)
-#     largest = max(regions, key=lambda r: r.area)
-
-#     minr, minc, maxr, maxc = largest.bbox
-
-#     # vorrei che il crop fosse almeno min_size x min_size
-#     h = maxr - minr
-#     w = maxc - minc
-
-#     if h < min_size:
-#         pad = min_size - h
-#         minr -= pad // 2
-#         maxr += pad - pad // 2
-
-#     if w < min_size:
-#         pad = min_size - w
-#         minc -= pad // 2
-#         maxc += pad - pad // 2
-    
-#     H, W = x.shape
-#     minr = max(0, minr)
-#     minc = max(0, minc)
-#     maxr = min(H, maxr)
-#     maxc = min(W, maxc)
-
-#     cropped = x[minr:maxr, minc:maxc]
-
-#     return cropped, (minr, minc, maxr, maxc), mask
-
-# ### MONAI wrapper
-# class BodyCropOtsu(Transform):
-#     def __init__(self, closing_radius=7, margin=10, min_size=224):
-#         self.closing_radius = closing_radius
-#         self.margin = margin
-#         self.min_size = min_size
-
-#     def __call__(self, x):
-#         # x is torch.Tensor (H, W) or (1, H, W)
-#         if x.ndim == 3:
-#             x = x[0]  # remove channel for processing
-
-#         x_np = x.detach().cpu().numpy()
-
-#         # call function
-#         x_out, _, _ = extract_body_crop_otsu(x_np, self.min_size)
-
-#         # # back to tensor
-#         # x_out = torch.from_numpy(x_out).unsqueeze(0).to(x.device)
-
-#         ### read the otsu crops json and apply the crop corresponding to the img path
-
-#         return x_out
-
-# def set_window(x, window_level=40, window_width=400):
-  
-#     low = window_level - window_width // 2
-#     high = window_level + window_width // 2
-#     x_win = np.clip(x, low, high)
-
-#     # normalize
-#     x_norm = (x_win - low) / (high - low)  # 0, 1
-
-#     return x_norm
 
 def set_window_gpu(x, window_level=40, window_width=400):
 
@@ -116,10 +32,6 @@ def set_window_gpu(x, window_level=40, window_width=400):
     # Normalize to [0, 1]
     x = (x - low) / (high - low)
 
-    # # Optional: map to arbitrary range (e.g. [-1,1])
-    # if (self.out_min, self.out_max) != (0.0, 1.0):
-    #     x = x * (self.out_max - self.out_min) + self.out_min
-
     return x
 
 ### MONAI wrapper
@@ -130,21 +42,8 @@ class Windowing(Transform):
         self.out_min, self.out_max = out_range
 
     def __call__(self, x):
-        # x: torch.Tensor in HU, shape (1, H, W)
-        
-        # if x.ndim == 3:
-        #     x = x[0]  # remove channel for processing
-
-        # x_np = x.detach().cpu().numpy()
-
-        # x è giù numpy array
-
-        # call function
-        # x_out = set_window(x, self.wl, self.ww)
+       
         x_out = set_window_gpu(x, self.wl, self.ww)
-
-        # # back to tensor
-        # x_out = torch.from_numpy(x_out).unsqueeze(0).to(x.device)
 
         return x_out
 
@@ -176,6 +75,20 @@ class ShallowFeatureExtractor(nn.Module):
         x = x.view(x.size(0), -1)             # Flatten
         features = self.fc(x)                 # Feature vector
         return features
+
+class SiameseModel(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.resnet = ShallowFeatureExtractor()
+
+        self.head = nn.Linear(512, 2)
+
+    def forward(self, x, x_hat):      
+        z = self.resnet(x)               
+        z_hat = self.resnet(x_hat)       
+        z_full = torch.cat([z, z_hat], dim=1)
+        y_pred = self.head(z_full)
+        return y_pred
     
 #### keep sample of the artifact separated from application of it 
 def sample_degradation():
@@ -446,17 +359,6 @@ def degradazioni():
         else:  # Sharpen
             # Applica Sharpen a un'immagine 8-bit (0-255)
 
-            # img8 = img
-            # if img8.dtype != np.uint8:
-            #     # Porta su 0-255 rispettando il range corrente
-            #     i_min = float(np.min(img8))
-            #     i_max = float(np.max(img8))
-            #     if i_max > i_min:
-            #         img8 = (img8 - i_min) / (i_max - i_min)
-            #     else:
-            #         img8 = np.zeros_like(img8, dtype=np.float32)
-            #     img8 = np.clip(img8 * 255.0, 0, 255).astype(np.uint8)
-
             img_norm = (img - img_min) / (img_max - img_min)  # 0–1
             img_uint8 = np.clip(img_norm * 255.0, 0, 255).astype(np.uint8)
 
@@ -479,54 +381,16 @@ def degradazioni():
 
     return _apply
 
-############# maybe these functions could be avoided ...
-def ensure_chlast(x: np.ndarray) -> np.ndarray:
-    if x.ndim == 2:
-        return x[..., np.newaxis] 
-    if x.ndim == 3:
-        if x.shape[0] <= 4 and x.shape[1] > 32 and x.shape[2] > 32:
-            return np.moveaxis(x, 0, -1) 
-        return x  
-    raise ValueError(f"Forma immagine non attesa: {x.shape}")
-
-def chlast_to_cd_hw(x_chlast: np.ndarray) -> np.ndarray:
-    s_h_w = np.moveaxis(x_chlast, -1, 0)  
-    #return s_h_w[np.newaxis, ...]         
-    return s_h_w
-
-####################
-
 def random_patch_selection(h, w, crop_size=TARGET_HW):
 
     top = randrange(0, max(1, h - crop_size))
     left = randrange(0, max(1, w - crop_size))
-
-    # cropped = x[:, :, top:top+crop_size, left:left+crop_size]
-    # ritorno gli indici per fare lo stesso crop su x e x_hat
 
     return top, left
 
 class DegradedPairDataset(Dataset):
     # def __init__(self, root_path="/Prove/Albisani/TCIA_datasets/train", mode='train'):
     def __init__(self, mode='train'):
-        # self.image_files = []  # full dose 
-        # self.low_dose_images = []
-        # # self.otsu_crops = []  # key is idx as for images (not img_path)
-
-        # jsonl_path = '/Prove/Albisani/TCIA_datasets/otsu_crops_new_train.jsonl'
-        # with open(jsonl_path, "r") as f:
-        #     for line in f:
-        #         entry = json.loads(line)
-        #         self.image_files.append(entry["full_dose_npy"])  # npy otsu cropped
-        #         self.low_dose_images.append(entry["low_dose_npy"])
-            
-        # jsonl_path = '/Prove/Albisani/TCIA_datasets/otsu_crops_new_train.jsonl'
-        # with open(jsonl_path, "r") as f:
-        #     for line in f:
-        #         entry = json.loads(line)
-        #         self.image_files.append(entry["full_dose_path"])
-        #         self.low_dose_images.append(entry["low_dose_path"])
-        #         self.otsu_crops.append(entry["crop"])
 
         root_path=f"/Prove/Albisani/TCIA_datasets/{mode}_cropped_npy"
 
@@ -545,38 +409,7 @@ class DegradedPairDataset(Dataset):
         self.image_files = [p[0] for p in pairs]
         self.low_dose_images = [p[1] for p in pairs]
 
-        # self.preprocess = Compose([
-        #     LoadImage(image_only=True),  
-        #     lambda x: x.as_tensor(),   # MetaTensor -> plain torch.Tensor
-        #     # crop con otsu 
-        #     # BodyCropOtsu()
-        # ])
-
-        self.postprocess = Windowing(window_level=40, window_width=400)  # soft-tissue window
-        
-        # self.image_tensors, self.low_dose_tensors = zip(*[
-        #     (self.preprocess(fd), self.preprocess(ld))
-        #     for fd, ld in zip(self.image_files, self.low_dose_images)
-        # ])
-
-        # for patient_folder in os.listdir(root_path):
-        #     patient_path = os.path.join(root_path, patient_folder)
-        #     if os.path.isdir(patient_path):
-        #         image_dir = os.path.join(patient_path, "Full_Dose_Images")
-        #         if os.path.isdir(image_dir):
-        #             for root, _, files in os.walk(image_dir):
-        #                 for f in files:
-        #                     if f.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".tif", ".dcm")):
-        #                         full_dose_path = os.path.join(root, f)
-        #                         self.image_files.append(full_dose_path)
-
-        #                         low_dose_path = full_dose_path.replace("Full_Dose_Images", "Low_Dose_Images")
-        #                         self.low_dose_images.append(low_dose_path)
-        
-        # filepath to recover otsu crops 
-        # self.otsu_crop_file = f'/Prove/Albisani/TCIA_datasets/otsu_crops_{mode}.json'
-        # with open(self.otsu_crop_file) as f:
-        #     self.otsu_crops = json.load(f)
+        # self.postprocess = Windowing(window_level=40, window_width=400)  # soft-tissue window
             
     def __len__(self):
         return len(self.image_files)
@@ -658,203 +491,13 @@ class DegradedPairDataset(Dataset):
             x_crop = x[:, top1:top1+TARGET_HW, left1:left1+TARGET_HW].contiguous()
             x_hat_crop = x_hat[:, top2:top2+TARGET_HW, left2:left2+TARGET_HW].contiguous()
 
-        y = random.randint(0, 1)
-        if y == 0:
-            return x_crop, x_hat_crop, y
-        else:
-            return x_hat_crop, x_crop, y
+        # y = random.randint(0, 1)
+        # if y == 0:
+        #     return x_crop, x_hat_crop, y
+        # else:
+        #     return x_hat_crop, x_crop, y
 
-# def __getitem__(self, idx):
-#     # img_path = self.image_files[idx]
-
-#     # ### load
-#     # x = self.preprocess(img_path)
-#     x = self.image_tensors[idx]
-
-#     ## retrieve corresponding otsu crop
-#     minr, minc, maxr, maxc = self.otsu_crops[idx]
-#     x = x[minr:maxr, minc:maxc]  # H, W torch
-
-#     r = random.random()
-#     quality_label = None
-#     crop_mode = 'same'
-#     if r <= 0.25:
-#         x = x.float().unsqueeze(0).contiguous()   # H, W, 1
-
-#         #### x vs x_hat (low dose)
-#         # low_dose_img_path = self.low_dose_images[idx]
-
-#         # ### load
-#         # x_hat = self.preprocess(low_dose_img_path)
-#         x_hat = self.low_dose_tensors[idx]
-
-#         ## apply otsu crop ( è lo stesso per la full dose)
-#         x_hat = x_hat[minr:maxr, minc:maxc]
-#         x_hat = x_hat.float().unsqueeze(0).contiguous()  # 1, H, W
-    
-#     elif 0.25 < r <= 0.6:
-#         x_np = x.detach().cpu().numpy()
-#         x = x.float().unsqueeze(0).contiguous()  # 1, H, W
-
-#         #### x vs x_hat
-#         crop_mode = "same" if random.random() < 0.8 else "different"
-
-#         art, level_x_hat, p, parametri = sample_degradation()
-#         x_hat = build_degradation(artefatto=art, p=p)(x_np)  # H, W, 1
-#         x_hat = torch.from_numpy(x_hat).permute(2,0,1).float().contiguous() # 1, H, W torch
-        
-#     else:
-#         x_np = x.detach().cpu().numpy()
-
-#         #### x1_hat vs x2_hat
-#         art1, level_x1_hat, p1, parametri = sample_degradation()
-#         x1_hat = build_degradation(artefatto=art1, p=p1)(x_np)
-#         x1_hat = torch.from_numpy(x1_hat).permute(2,0,1).float().contiguous() # 1, H, W torch
-
-#         p2, quality_label = sample_paired_degradation(artefatto=art1, level_x1_hat=level_x1_hat, 
-#                                                       p1=p1, parametri=parametri)
-#         x2_hat = build_degradation(artefatto=art1, p=p2)(x_np)  # H, W, 1
-#         x2_hat = torch.from_numpy(x2_hat).permute(2,0,1).float().contiguous() # 1, H, W torch
-
-#     if quality_label is not None:
-#         if quality_label == 0:
-#             # x2_hat > x1_hat 
-#             x = x2_hat
-#             x_hat = x1_hat
-#         else:
-#             # x2_hat < x1_hat 
-#             x = x1_hat
-#             x_hat = x2_hat
-
-#     ### windowing and/or normalization
-#     x = self.postprocess(x)  # C, H, W
-#     x_hat = self.postprocess(x_hat)
-
-#     ### random patch
-#     h, w = x.shape[1], x.shape[2]
-#     # 50% same crop, 50% different
-#     if crop_mode == 'same':
-#         # same crop
-#         top, left = random_patch_selection(h, w, crop_size=TARGET_HW)
-
-#         x_crop = x[:, top:top+TARGET_HW, left:left+TARGET_HW].contiguous()
-#         x_hat_crop = x_hat[:, top:top+TARGET_HW, left:left+TARGET_HW].contiguous()
-#     else:
-#         # different crops
-#         top1, left1 = random_patch_selection(h, w, crop_size=TARGET_HW)
-#         top2, left2 = random_patch_selection(h, w, crop_size=TARGET_HW)
-
-#         x_crop = x[:, top1:top1+TARGET_HW, left1:left1+TARGET_HW].contiguous()
-#         x_hat_crop = x_hat[:, top2:top2+TARGET_HW, left2:left2+TARGET_HW].contiguous()
-
-#     y = random.randint(0, 1)
-#     if y == 0:
-#         return x_crop, x_hat_crop, y
-#     else:
-#         return x_hat_crop, x_crop, y
-        
-#     def __getitem__(self, idx):
-# img_path = self.image_files[idx]
-
-# ### load
-# x = self.preprocess(img_path)
-
-# ## retrieve corresponding otsu crop
-# minr, minc, maxr, maxc = self.otsu_crops[img_path]
-# x = x[minr:maxr, minc:maxc]
-
-# ## passo a numpy per inserire l'artefatto
-# if not isinstance(x, np.ndarray):
-#     x = np.asarray(x)
-
-# x = x.astype(np.float32, copy=False)
-# x_chlast = ensure_chlast(x)   # H, W, 1
-
-# if random.random() <= 0.3:
-#     #### use low dose as x_hat
-#     low_dose_img_path = self.low_dose_images[idx]
-
-#     ### load
-#     x_hat = self.preprocess(low_dose_img_path)
-
-#     ## apply otsu crop ( è lo stesso per la full dose)
-#     x_hat = x_hat[minr:maxr, minc:maxc]
-
-#     ## passo a numpy per inserire l'artefatto
-#     if not isinstance(x, np.ndarray):
-#         x = np.asarray(x)
-
-#     x = x.astype(np.float32, copy=False)
-#     x_chlast = ensure_chlast(x)   # H, W, 1
-
-# elif 0.3 < random.random() <= 0.6:
-#     #### x1_hat vs x2_hat
-#     art1, level_x1_hat, p1, parametri = sample_degradation(x_chlast)
-#     x1_hat = build_degradation(artefatto=art1, p=p1)
-
-#     p2, quality_label = sample_paired_degradation(x_chlast)
-#     x2_hat = build_degradation(artefatto=art1, p=p2)
-
-# else:
-#     #### x vs x_hat
-
-#     #### artifact simulation
-#     aug = degradazioni()
-
-#     x_hat_chlast = aug(x_chlast)
-#     x_hat_chlast = ensure_chlast(x_hat_chlast)
-
-# x_cd_hw = chlast_to_cd_hw(x_chlast)  # 1, H, W
-# # x_cd_hw = np.repeat(x_cd_hw, 3, axis=0)  # non voglio lavorare a tre canali 
-# xhat_cd_hw = chlast_to_cd_hw(x_hat_chlast)
-# # xhat_cd_hw = np.repeat(xhat_cd_hw, 3, axis=0)
-
-# ### windowing and/or normalization
-# x = self.postprocess(x_cd_hw)  # C, H, W
-# x_hat = self.postprocess(xhat_cd_hw)
-
-# ### random patch
-# h, w = x.shape[1], x.shape[2]
-# # 50% same crop, 50% different
-# if random.random() < 0.5:
-#     # same crop
-#     top, left = random_patch_selection(h, w, crop_size=TARGET_HW)
-
-#     x_crop = x[:, top:top+TARGET_HW, left:left+TARGET_HW]
-#     x_hat_crop = x_hat[:, top:top+TARGET_HW, left:left+TARGET_HW]
-# else:
-#     # different crops
-#     top1, left1 = random_patch_selection(h, w, crop_size=TARGET_HW)
-#     top2, left2 = random_patch_selection(h, w, crop_size=TARGET_HW)
-
-#     x_crop = x[:, top1:top1+TARGET_HW, left1:left1+TARGET_HW]
-#     x_hat_crop = x_hat[:, top2:top2+TARGET_HW, left2:left2+TARGET_HW]
-
-# # h, w = x.shape[1], x.shape[2]
-# # top, left = random_patch_selection(h, w, crop_size=TARGET_HW)
-
-# # x_crop = x[:, top:top+TARGET_HW, left:left+TARGET_HW]
-# # x_hat_crop = x_hat[:, top:top+TARGET_HW, left:left+TARGET_HW]
-
-# y = random.randint(0, 1)
-# if y == 0:
-#     return x_crop, x_hat_crop, y
-# else:
-#     return x_hat_crop, x_crop, y
-
-class SiameseModel(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.resnet = ShallowFeatureExtractor()
-
-        self.head = nn.Linear(512, 2)
-
-    def forward(self, x, x_hat):      
-        z = self.resnet(x)               
-        z_hat = self.resnet(x_hat)       
-        z_full = torch.cat([z, z_hat], dim=1)
-        y_pred = self.head(z_full)
-        return y_pred
+        return x_crop, x_hat_crop
 
 if __name__ == '__main__':
 
@@ -899,12 +542,7 @@ if __name__ == '__main__':
     experiment.set_name(args.name_exp)
     ek = experiment.get_key()
 
-    # train_siamese_path = "/Prove/Albisani/TCIA_datasets/train"
-    # test_siamese_path  = "/Prove/Albisani/TCIA_datasets/test"
-
     # Datasets e Dataloaders
-    # train_dataset = DegradedPairDataset(train_siamese_path, mode='train')
-    # test_dataset  = DegradedPairDataset(test_siamese_path, mode='test')
     train_dataset = DegradedPairDataset(mode='train')
     test_dataset  = DegradedPairDataset(mode='test')
 
@@ -912,7 +550,6 @@ if __name__ == '__main__':
     test_dataloader  = DataLoader(dataset=test_dataset,  batch_size=int(args.batch_size), num_workers=4)
 
     model = SiameseModel()
-    model = model.to(device)
     
     # Total parameters
     total_params = sum(p.numel() for p in model.parameters())

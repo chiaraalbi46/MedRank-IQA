@@ -413,19 +413,21 @@ def save_crop_otsu_indices_finetuning(mode):
 if __name__ == "__main__":
     import pandas as pd
 
-    mode = 'test'
-    save_crop_otsu_indices_pretraining(mode)
+    mode = 'train'
+    # save_crop_otsu_indices_pretraining(mode)
     ## 
-    # processed_images = set()
-    # with open(f'/Prove/Albisani/TCIA_datasets/otsu_crops_{mode}.jsonl', "r") as f:
-    #     for line in f:
-    #         try:
-    #             entry = json.loads(line)
-    #             processed_images.update(entry.keys())
-    #         except json.JSONDecodeError:
-    #             continue
-    # print(len(processed_images))
-    # pass
+    processed_images = set()
+    c = 0
+    with open(f'/Prove/Albisani/TCIA_datasets/otsu_crops_npy_{mode}.jsonl', "r") as f:
+        for line in f:
+            try:
+                entry = json.loads(line)
+                processed_images.update(entry.keys())
+            except json.JSONDecodeError:
+                continue
+            c = c + 1
+    print(len(processed_images), c)
+    pass
 
 
     # ########################### train
