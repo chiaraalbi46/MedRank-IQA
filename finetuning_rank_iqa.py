@@ -17,9 +17,24 @@ import random
 from random import randrange
 from torch.optim.lr_scheduler import StepLR
 from scipy.stats import spearmanr, kendalltau, pearsonr
-from pretraining_rank_iqa import RankIQA_branch, Vgg16
+from pretraining_networks import RankIQA_branch, Vgg16, Resnet18RankIQA_branch, Resnet18, SqueezeNet1_1RankIQA_branch, SqueezeNet1_1
+
+from early_stopping import EarlyStopping, evaluate_loss, load_sampling_dict, cumulative_indices_for_total, guess_name_column, indices_to_train_paths, subset_path_score_dict_by_paths, build_dict_from_indices, remaining_indices
 
 from utils import build_path_score_dict # TODO: with the new csv files this function maybe should be avoided...
+
+def set_global_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+    # Makes CuDNN deterministic (important!)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+base_seed = 42
+set_global_seed(base_seed)
  
 TARGET_HW = 224
 
@@ -29,87 +44,6 @@ def random_patch_selection(h, w, crop_size=TARGET_HW):
     left = randrange(0, max(1, w - crop_size))
 
     return top, left
-
-# Sampling JSON helpers 
-def load_sampling_dict(sampling_json_path: str) -> dict[int, list[int]]:
-    with open(sampling_json_path, "r", encoding="utf-8") as f:
-        d = json.load(f)
-    return {int(k): [int(x) for x in v] for k, v in d.items()}
-
-
-def cumulative_indices_for_total(sampling_dict: dict[int, list[int]], total: int) -> list[int]:
-    blocks = sorted(sampling_dict.keys())  # e.g. [12,48,240,612]
-    out = []
-    s = 0
-    for b in blocks:
-        out.extend(sampling_dict[b])
-        s += b
-        if s == total:
-            return out
-        if s > total:
-            raise ValueError(
-                f"total={total} non è raggiungibile con somme progressive dei blocchi {blocks}. "
-                f"Somma superata a {s}."
-            )
-    raise ValueError(f"total={total} troppo grande. Massimo raggiungibile={s} con blocchi {blocks}.")
-
-
-def guess_name_column(df: pd.DataFrame) -> str | None:
-    preferred = ["img_name", "image", "fname", "filename", "name", "id"]
-    cols = list(df.columns)
-
-    for c in preferred:
-        if c in cols:
-            return c
-
-    for c in cols:
-        if df[c].dtype == object:
-            sample = df[c].dropna().astype(str).head(20).tolist()
-            if any((".tif" in s.lower() or ".tiff" in s.lower() or ".png" in s.lower() or ".jpg" in s.lower())
-                   for s in sample):
-                return c
-            if all(len(s) > 0 for s in sample):
-                return c
-    return None
-
-
-def indices_to_train_paths(train_map_csv: str, images_root: str, selected_indices: list[int]) -> list[str]:
-    df = pd.read_csv(train_map_csv, index_col=0)
-    name_col = guess_name_column(df)
-
-    paths = []
-    for i in selected_indices:
-        if i not in df.index:
-            raise KeyError(f"Indice {i} non presente nel train_map.csv (index_col=0).")
-
-        if name_col is None:
-            stem = str(df.loc[i].name)
-        else:
-            stem = str(df.loc[i, name_col])
-        stem = stem.strip()
-
-        lower = stem.lower()
-        if lower.endswith((".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp")):
-            rel = stem
-        else:
-            rel = stem + ".tif"
-
-        img_path = os.path.join(images_root, rel)
-        paths.append(img_path)
-
-    return paths
-
-def subset_path_score_dict_by_paths(path_score_dict: dict[str, float], keep_paths: list[str]) -> dict[str, float]:
-    out = {}
-    missing = 0
-    for p in keep_paths:
-        if p in path_score_dict:
-            out[p] = path_score_dict[p]
-        else:
-            missing += 1
-    if missing > 0:
-        print(f"Warning: {missing} path selezionati non trovati in path_score_dict (controlla root/estensione).")
-    return out
 
 
 class FineTuningDictDataset(Dataset):
@@ -125,6 +59,14 @@ class FineTuningDictDataset(Dataset):
 
         # filepath to recover otsu crops 
         self.otsu_crop_file = f'/Prove/Albisani/LDCTIQA_dataset/otsu_crops_finetuning_{mode}.json'
+        
+        ####### per validation
+        if not os.path.exists(self.otsu_crop_file):
+            fallback = '/Prove/Albisani/LDCTIQA_dataset/otsu_crops_finetuning_train.json'
+            print(f"[FineTuningDictDataset] Warning: {self.otsu_crop_file} non trovato. Uso fallback: {fallback}")
+            self.otsu_crop_file = fallback
+        #######
+        
         with open(self.otsu_crop_file) as f:
             self.otsu_crops = json.load(f)
 
@@ -192,13 +134,13 @@ if __name__ == '__main__':
     parser.add_argument('sampling_json', nargs='?', default='./sampling_dict_12_48_240_612_seed42.json',
                     help="path to sampling indices json file. sampling_dict_12_48_240_612_*.json")
     
-    parser.add_argument('--file_path', dest="file_path", nargs='?', default='./Pytorch_TestRankIQA_pretrained/Rank_tid2013.caffemodel.pt',
+    parser.add_argument('--file_path', dest="file_path", nargs='?', default=None,  # './Pytorch_TestRankIQA_pretrained/Rank_tid2013.caffemodel.pt',
                         help="path to the pretrained model (phase 1). if None the model is trained from scratch.") #se nella riga di comando sul terminale non ci metto niente, lui non 
     #carica niente cioè non carica il modello con i pesi salvati, se ci scrivo il nome del file con i pesi salvati invece li carica 
     
     # comet parameters
     parser.add_argument("--comet", dest="comet", default=1, help="1 for comet ON, 0 for comet OFF")
-    parser.add_argument("--name_proj", dest="name_proj", default='medrank-iqa-finetuning', help="define comet ml project folder")
+    parser.add_argument("--name_proj", dest="name_proj", default='medrank-iqa-finetuning-NEW', help="define comet ml project folder")
     # parser.add_argument("--name_exp", dest="name_exp", default='soft_tissue_window', help="name of comet ml experiment")
 
     parser.add_argument("--batch_size", dest="batch_size", default=32, help="batch size for train and test")
@@ -211,10 +153,15 @@ if __name__ == '__main__':
     parser.add_argument('--finetune-backbone-lr-multiplier', default=None, type=float, help='learning rate multiplier used to finetune the backbone')
     parser.add_argument('--finetune-backbone-freeze-epochs', default=0, type=float, help='epochs to keep the backbone frozen when finetuning (only used if learning rate multiplier is specified)')
     
-    parser.add_argument("--learning_rate", dest="learning_rate", type=float, default=1e-5, help="base learning rate")
+    parser.add_argument("--learning_rate", dest="learning_rate", type=float, default=1e-4, help="base learning rate")
 
-    parser.add_argument('--imagenet-initialization', dest="imagenet-initialization",  default=None, help='use (1) or not (None) imagenet weights for VGG16')
+    parser.add_argument("--patience", dest="patience", type=int, default=10,
+                    help="early stopping patience (used only if validation is enabled)")
+
+    parser.add_argument('--imagenet_initialization', dest="imagenet_initialization",  default=None, help='use (1) or not (None) imagenet weights for VGG16')
      # '/data/lesc/staff/albisani/MedRank-IQA/Pytorch_TestRankIQA_pretrained/Rank_tid2013.caffemodel.pt'
+
+    parser.add_argument('--network_model', dest="network_model",  default='vgg16', help='specify the network to use. vgg16, resnet18')
 
     args = parser.parse_args()
 
@@ -223,7 +170,16 @@ if __name__ == '__main__':
 
     n_epochs = int(args.n_epochs)
 
-    base_finetuned_folder = './RESULTS_VGG_PRETRAINED'  ### where test subfolders are stored
+    # base_finetuned_folder = './RESULTS_VGG_PRETRAINED'  ### where test subfolders are stored
+    # base_finetuned_folder = './RESULTS_VGG_PRETRAINED_NEW'
+
+    if args.network_model == 'vgg16':
+        base_finetuned_folder = './RESULTS_VGG'
+    elif args.network_model == 'resnet18':
+        base_finetuned_folder = './RESULTS_RESNET18'
+    else:
+        base_finetuned_folder = './RESULTS_SQUEEZENET1_1'
+        
     os.makedirs(base_finetuned_folder, exist_ok=True)
 
     train_images_root = "/Prove/Albisani/LDCTIQA_dataset/LDCTIQAG2023_train/image"
@@ -239,22 +195,43 @@ if __name__ == '__main__':
 
     # Seleziona sottogruppo di N immagini per fare finetuning usando indici json 
     train_images = 'all'  # if None all available train images are used
+    val_dict = None
     if args.n_finetuning is not None:
         train_images = str(args.n_finetuning)
         if args.sampling_json is None:
             raise ValueError("Hai passato n_finetuning ma non --sampling_json. Serve per caricare gli indici.")
 
         sampling_dict = load_sampling_dict(args.sampling_json)
-        selected_indices = cumulative_indices_for_total(sampling_dict, args.n_finetuning)
 
-        selected_paths = indices_to_train_paths(
+        # selected_indices = cumulative_indices_for_total(sampling_dict, args.n_finetuning)
+
+        # selected_paths = indices_to_train_paths(
+        #     train_map_csv=train_map_csv_default,
+        #     images_root=train_images_root,
+        #     selected_indices=selected_indices
+        # )
+        # train_dict = subset_path_score_dict_by_paths(train_dict_full, selected_paths)
+
+        used_train_indices = cumulative_indices_for_total(sampling_dict, args.n_finetuning)
+
+        train_dict = build_dict_from_indices(
             train_map_csv=train_map_csv_default,
             images_root=train_images_root,
-            selected_indices=selected_indices
+            indices=used_train_indices,
+            full_path_score_dict=train_dict_full
         )
 
-        train_dict = subset_path_score_dict_by_paths(train_dict_full, selected_paths)
         print(f"Fine-tuning subset selezionato: {len(train_dict)}/{len(train_dict_full)} immagini (target={args.n_finetuning})")
+
+        # Validation = tutte le immagini del train non campionate nel subset
+        val_indices = remaining_indices(train_map_csv_default, used_train_indices)
+        val_dict = build_dict_from_indices(
+            train_map_csv=train_map_csv_default,
+            images_root=train_images_root,
+            indices=val_indices,
+            full_path_score_dict=train_dict_full
+        )
+        print(f"Validation (complemento): {len(val_dict)} immagini (non campionate)")
     else:
         train_dict = train_dict_full
         print(f"Fine-tuning su tutto il train set: {len(train_dict)} immagini")
@@ -264,6 +241,12 @@ if __name__ == '__main__':
 
     train_dataloader_finetuning = DataLoader(dataset=train_dataset_finetuning, batch_size=int(args.batch_size), shuffle=True)
     test_dataloader_finetuning  = DataLoader(dataset=test_dataset_finetuning,  batch_size=int(args.batch_size))
+
+    val_dataloader_finetuning = None
+    if val_dict is not None and len(val_dict) > 0:
+        val_dataset_finetuning = FineTuningDictDataset(val_dict, n=None, return_path=False, mode='val')
+        val_dataloader_finetuning = DataLoader(dataset=val_dataset_finetuning, batch_size=int(args.batch_size), shuffle=False)
+
 
     # # Caricamento o meno dei pesi preaddestrati della fase 1
     # model = SiameseModel()
@@ -287,10 +270,18 @@ if __name__ == '__main__':
             model = RankIQA_branch(vgg_model=vgg).to(device)
 
         else:
-            print("Load our pretrained weights")
+            print(f"Load our {args.network_model} pretrained weights")
             ## questo quando carico con modello pretrained su ct (siamese)
-            vgg = Vgg16(imagenet=args.imagenet_initialization)
-            model = RankIQA_branch(vgg_model=vgg).to(device)
+
+            if args.network_model == 'vgg16':
+                vgg = Vgg16(imagenet=args.imagenet_initialization)
+                model = RankIQA_branch(vgg_model=vgg).to(device)
+            elif args.network_model == 'resnet18':
+                vgg = Resnet18(imagenet=args.imagenet_initialization)
+                model = Resnet18RankIQA_branch(resnet18_model=vgg).to(device)
+            else:
+                vgg = SqueezeNet1_1(imagenet=args.imagenet_initialization)
+                model = SqueezeNet1_1RankIQA_branch(squeezenet1_1_model=vgg).to(device)
 
             state_dict = torch.load(args.file_path, map_location=device)
             # model.load_state_dict(state_dict, strict=True)
@@ -300,11 +291,23 @@ if __name__ == '__main__':
                     if k.startswith("scorer.")
                 }
             model.load_state_dict(scorer_state_dict, strict=True)
+    
+    else:
 
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Trainable parameters: {trainable_params}")
+        if args.network_model == 'vgg16':
+            print("Test VGG16 from scratch")
+            vgg = Vgg16(imagenet=args.imagenet_initialization)
+            model = RankIQA_branch(vgg_model=vgg).to(device)
+        elif args.network_model == 'resnet18':
+            print("Test Resnet18 from scratch")
+            vgg = Resnet18(imagenet=args.imagenet_initialization)
+            model = Resnet18RankIQA_branch(resnet18_model=vgg).to(device)
+        elif args.network_model == 'squeezenet1_1':
+            print("Test SqueezeNet 1.1 from scratch")
+            vgg = SqueezeNet1_1(imagenet=args.imagenet_initialization)
+            model = SqueezeNet1_1RankIQA_branch(squeezenet1_1_model=vgg).to(device)
 
-    dest_folder_name = f'from_scratch_{train_images}'
+    dest_folder_name = f'from_scratch_{train_images}_{args.network_model}'
     learning_rate = float(args.learning_rate)
     if args.file_path is not None:
         optim = Adam(model.head.parameters(), lr=learning_rate, weight_decay=1e-4)
@@ -315,9 +318,18 @@ if __name__ == '__main__':
             optim_backbone = None
         pretrained_model = args.file_path.split('/')[-1].split('.')[0]
         dest_folder_name = f'finetuning_{pretrained_model}_{train_images}'
+        
     else:
         optim = Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-        optim_backbone = None
+        # optim_backbone = None
+        if args.finetune_backbone_lr_multiplier is not None:
+            # optim_backbone = Adam(model.resnet.parameters(), lr=learning_rate * args.finetune_backbone_lr_multiplier, weight_decay=1e-4)
+            optim_backbone = Adam(model.features.parameters(), lr=learning_rate * args.finetune_backbone_lr_multiplier, weight_decay=1e-4)
+        else:
+            optim_backbone = None
+
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Trainable parameters: {trainable_params}")
         
     criterion = nn.MSELoss()
 
@@ -352,7 +364,33 @@ if __name__ == '__main__':
     experiment.set_name(name_exp)  # comet experiment has the same name of the destination folder
     ek = experiment.get_key()
 
+    experiment.log_parameters({
+        "learning_rate": float(learning_rate),
+        "patience": int(args.patience),
+        "finetune_backbone_lr_multiplier": None if args.finetune_backbone_lr_multiplier is None else float(args.finetune_backbone_lr_multiplier),
+        "finetune_backbone_freeze_epochs": float(args.finetune_backbone_freeze_epochs),
+        "batch_size": int(args.batch_size),
+        "n_epochs": int(args.n_epochs),
+        "n_finetuning": None if args.n_finetuning is None else int(args.n_finetuning),
+        "pretrained_file_path": None if args.file_path is None else str(args.file_path),
+        "imagenet_initialization": args.imagenet_initialization,
+        "network_model": args.network_model
+    })
+
     optim_backbone_freeze = args.finetune_backbone_freeze_epochs
+
+    early_stopping_enabled = None  # (val_dataloader_finetuning is not None)
+    best_path = os.path.join(dest_folder, "best_model.pth")
+
+    early_stopper = None
+    if early_stopping_enabled:
+        early_stopper = EarlyStopping(
+            patience=int(args.patience),
+            verbose=True,
+            delta=1e-4,
+            path=best_path,
+            trace_func=print
+        )
 
     for epoch in tqdm(range(n_epochs)):
         model.train()
@@ -382,80 +420,178 @@ if __name__ == '__main__':
         train_loss_mean = np.mean(train_losses)
         experiment.log_metric("train_loss", train_loss_mean, step=epoch)
 
-        if True or (epoch == 0) or ((epoch + 1) % 10 == 0):
-            model.eval()
-            test_losses = []
+        if early_stopping_enabled:
+            val_loss_mean = evaluate_loss(model, val_dataloader_finetuning, device, criterion)
+            experiment.log_metric("val_loss", val_loss_mean, step=epoch)
 
-            all_predictions = []
-            all_targets = []
-            all_names = []   # per allineamento pred/gt con l'immagine
-
-            with tqdm(test_dataloader_finetuning, leave=False, desc="Test") as t:
-                for batch in t:
-                    x, y, paths = batch
-                    x = x.to(device)
-                    y = y.to(device)
-
-                    if x.size(1) == 1:
-                        x = x.repeat(1, 3, 1, 1)
-
-                    with torch.no_grad():
-                        y_pred = model(x)
-
-                    loss = criterion(y_pred, y.unsqueeze(1))
-                    t.set_postfix(loss=loss.item())
-                    test_losses.append(loss.item())
-
-                    # Salva pred/gt nello stesso ordine
-                    y_pred = torch.clamp(y_pred, 0, 4)  # gt scores are between 0 and 4
-                    all_predictions.append(y_pred.squeeze(1).cpu().numpy())  
-                    all_targets.append(y.cpu().numpy())                    
-
-                    # Salva i nomi immagine (o path) puliti
-                    all_names.extend([os.path.basename(p) for p in paths])
-
-            # Concatenazione batch
-            all_predictions = np.concatenate(all_predictions, axis=0)  
-            all_targets     = np.concatenate(all_targets, axis=0)     
-
-            test_loss_mean = np.mean(test_losses)
-            # writer.add_scalar("test/loss", test_loss_mean, iteration)
-            experiment.log_metric("test_loss", test_loss_mean, step=epoch)
-
-            # Calcolo metriche ogni epoca
-            sp_corr, sp_p = spearmanr(all_predictions, all_targets)
-            kd_corr, kd_p = kendalltau(all_predictions, all_targets)
-            pr_corr, pr_p = pearsonr(all_predictions, all_targets)
-
-            # Stampa ogni epoca: loss + metriche
             print(
-                f"Epoch {epoch+1} - Test Loss: {test_loss_mean:.6f} | "
-                f"Spearman r={sp_corr:.6f} (p={sp_p:.2e}) | "
-                f"Kendall τ={kd_corr:.6f} (p={kd_p:.2e}) | "
-                f"Pearson r={pr_corr:.6f} (p={pr_p:.2e})"
+                f"Epoch {epoch+1} - Train Loss: {train_loss_mean:.6f} | "
+                f"Val Loss: {val_loss_mean:.6f}"
             )
 
-            experiment.log_metric("spearman", sp_corr, step=epoch)
-            experiment.log_metric("kendall", kd_corr, step=epoch)
-            experiment.log_metric("pearson", pr_corr, step=epoch)
+            early_stopper(val_loss_mean, model, epoch_1based=epoch + 1)
 
-            if epoch == (n_epochs - 1):  
-                # dizionari pred/gt
-                pred_dict = {name: float(pred) for name, pred in zip(all_names, all_predictions)}
-                # gt_dict   = {name: float(gt)   for name, gt   in zip(all_names, all_targets)}
+            if early_stopper.early_stop:
+                print(
+                    f"Early stopping at epoch {epoch+1}. "
+                    f"Best model saved at epoch {early_stopper.best_epoch} to: {best_path} "
+                    f"(best_val_loss={early_stopper.best_val_loss:.6f})"
+                )
+                break
 
-                with open(os.path.join(dest_folder, "predictions_finetuning_dict.json"), "w", encoding="utf-8") as f:
-                    json.dump(pred_dict, f, ensure_ascii=False, indent=2)
+        model.eval()
+        test_losses = []
+        all_predictions = []
+        all_targets = []
+        all_names = []   # per allineamento pred/gt con l'immagine
 
-                # metriche
-                metrics = {
-                    "spearman_r": float(sp_corr), "spearman_p": float(sp_p),
-                    "kendall_tau": float(kd_corr), "kendall_p": float(kd_p),
-                    "pearson_r": float(pr_corr), "pearson_p": float(pr_p),
-                }
-                with open(os.path.join(dest_folder, f"correlation_metrics_{epoch}.json"), "w", encoding="utf-8") as f:
-                    json.dump(metrics, f, indent=2)
+        with tqdm(test_dataloader_finetuning, leave=False, desc="Test") as t:
+            for batch in t:
+                # x, y, paths = batch
+                x, y, paths, = batch
+                x = x.to(device)
+                y = y.to(device)
+
+                if x.size(1) == 1:
+                    x = x.repeat(1, 3, 1, 1)
+
+                with torch.no_grad():
+                    y_pred = model(x)
+
+                loss = criterion(y_pred, y.unsqueeze(1))
+                t.set_postfix(loss=loss.item())
+                test_losses.append(loss.item())
+
+                # Salva pred/gt nello stesso ordine
+                y_pred = torch.clamp(y_pred, 0, 4)  # gt scores are between 0 and 4
+
+                y_pred_np = y_pred.squeeze(1).cpu().numpy()
+                y_np = y.cpu().numpy()
+
+                all_predictions.append(y_pred_np)  
+                all_targets.append(y_np)   
+
+                # all_predictions.append(y_pred.squeeze(1).cpu().numpy())  
+                # all_targets.append(y.cpu().numpy())                    
+
+                # Salva i nomi immagine (o path) puliti
+                all_names.extend([os.path.basename(p) for p in paths])
+
+        # Concatenazione batch
+        all_predictions = np.concatenate(all_predictions, axis=0)  
+        all_targets     = np.concatenate(all_targets, axis=0)     
+
+        test_loss_mean = np.mean(test_losses)
+        # writer.add_scalar("test/loss", test_loss_mean, iteration)
+        experiment.log_metric("test_loss", test_loss_mean, step=epoch)
+
+        # Calcolo metriche ogni epoca
+        sp_corr, sp_p = spearmanr(all_predictions, all_targets)
+        kd_corr, kd_p = kendalltau(all_predictions, all_targets)
+        pr_corr, pr_p = pearsonr(all_predictions, all_targets)
+
+        # Stampa ogni epoca: loss + metriche
+        print(
+            f"Epoch {epoch+1} - Test Loss: {test_loss_mean:.6f} | "
+            f"Spearman r={sp_corr:.6f} (p={sp_p:.2e}) | "
+            f"Kendall τ={kd_corr:.6f} (p={kd_p:.2e}) | "
+            f"Pearson r={pr_corr:.6f} (p={pr_p:.2e})"
+        )
+
+        experiment.log_metric("spearman", sp_corr, step=epoch)
+        experiment.log_metric("kendall", kd_corr, step=epoch)
+        experiment.log_metric("pearson", pr_corr, step=epoch)
+
+        # experiment.log_metric(f"{dist_type}_spearman", sp_corr, step=epoch)
+        # experiment.log_metric(f"{dist_type}_kendall", kd_corr, step=epoch)
+        # experiment.log_metric(f"{dist_type}_pearson", pr_corr, step=epoch)
 
         scheduler.step()  # should be every epoch
         if scheduler_backbone is not None and epoch >= optim_backbone_freeze:
             scheduler_backbone.step()  # should be every epoch
+    
+    # test finale sul modello con la migliore validation test
+    if os.path.exists(best_path):
+        model.load_state_dict(torch.load(best_path, map_location=device))
+    else:
+        torch.save(model.state_dict(), best_path)
+        last_epoch = epoch
+
+    model.eval()
+    test_losses = []
+    all_predictions = []
+    all_targets = []
+    all_names = []
+
+    with tqdm(test_dataloader_finetuning, leave=False, desc="Final Test") as t:
+        for batch in t:
+            x, y, paths = batch
+            x = x.to(device)
+            y = y.to(device)
+
+            if x.size(1) == 1:
+                x = x.repeat(1, 3, 1, 1)
+
+            with torch.no_grad():
+                y_pred = model(x)
+
+            loss = criterion(y_pred, y.unsqueeze(1))
+            t.set_postfix(loss=loss.item())
+            test_losses.append(loss.item())
+
+            y_pred = torch.clamp(y_pred, 0, 4)
+            all_predictions.append(y_pred.squeeze(1).cpu().numpy())
+            all_targets.append(y.cpu().numpy())
+            all_names.extend([os.path.basename(p) for p in paths])
+
+    all_predictions = np.concatenate(all_predictions, axis=0)
+    all_targets = np.concatenate(all_targets, axis=0)
+
+    test_loss_mean = np.mean(test_losses)
+    sp_corr, sp_p = spearmanr(all_predictions, all_targets)
+    kd_corr, kd_p = kendalltau(all_predictions, all_targets)
+    pr_corr, pr_p = pearsonr(all_predictions, all_targets)
+
+    print(
+        f"FINAL - Test Loss: {test_loss_mean:.6f} | "
+        f"Spearman r={sp_corr:.6f} (p={sp_p:.2e}) | "
+        f"Kendall τ={kd_corr:.6f} (p={kd_p:.2e}) | "
+        f"Pearson r={pr_corr:.6f} (p={pr_p:.2e})"
+    )
+
+    pred_dict = {name: float(pred) for name, pred in zip(all_names, all_predictions)}
+    with open(os.path.join(dest_folder, "predictions_finetuning_dict.json"), "w", encoding="utf-8") as f:
+        json.dump(pred_dict, f, ensure_ascii=False, indent=2)
+
+    metrics = {
+        "test_loss": float(test_loss_mean),
+        "spearman_r": float(sp_corr), "spearman_p": float(sp_p),
+        "kendall_tau": float(kd_corr), "kendall_p": float(kd_p),
+        "pearson_r": float(pr_corr), "pearson_p": float(pr_p),
+        "best_val_loss": float(early_stopper.best_val_loss) if early_stopper is not None else None,
+        "best_epoch": int(early_stopper.best_epoch) if early_stopper is not None else last_epoch
+    }
+    with open(os.path.join(dest_folder, "final_metrics.json"), "w", encoding="utf-8") as f:
+        json.dump(metrics, f, indent=2)
+
+
+        #     if epoch == (n_epochs - 1):  
+        #         # dizionari pred/gt
+        #         pred_dict = {name: float(pred) for name, pred in zip(all_names, all_predictions)}
+        #         # gt_dict   = {name: float(gt)   for name, gt   in zip(all_names, all_targets)}
+
+        #         with open(os.path.join(dest_folder, "predictions_finetuning_dict.json"), "w", encoding="utf-8") as f:
+        #             json.dump(pred_dict, f, ensure_ascii=False, indent=2)
+
+        #         # metriche
+        #         metrics = {
+        #             "spearman_r": float(sp_corr), "spearman_p": float(sp_p),
+        #             "kendall_tau": float(kd_corr), "kendall_p": float(kd_p),
+        #             "pearson_r": float(pr_corr), "pearson_p": float(pr_p),
+        #         }
+        #         with open(os.path.join(dest_folder, f"correlation_metrics_{epoch}.json"), "w", encoding="utf-8") as f:
+        #             json.dump(metrics, f, indent=2)
+
+        # scheduler.step()  # should be every epoch
+        # if scheduler_backbone is not None and epoch >= optim_backbone_freeze:
+        #     scheduler_backbone.step()  # should be every epoch
