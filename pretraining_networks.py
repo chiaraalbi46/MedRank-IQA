@@ -37,7 +37,7 @@ class Vgg16(nn.Module):
             # with torch.no_grad():
             #     model.features[0].weight[:] = old_conv.weight.mean(dim=1, keepdim=True)
         else:
-            model = torchvision.models.vgg16(pretrained=False, num_classes=1)  # original code (for loading pretrained model on natural images)
+            model = torchvision.models.vgg16(pretrained=False, num_classes=1)  # original code (for loading pretrained model on natural images)  # classifier[6] = Linear(4096, 1)
 
             # model.features[0] = nn.Conv2d(
             #     1, 64, kernel_size=3, stride=1, padding=1
