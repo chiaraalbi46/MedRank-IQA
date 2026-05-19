@@ -1,3 +1,5 @@
+""" Same as pretraining_rank_iqa_balanced_batches_v1.py but with same slice and same crop comparison (other than FD vs real)"""
+
 from comet_ml import Experiment, OfflineExperiment
 from torch.optim import Adam
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
@@ -17,14 +19,13 @@ import re
 import random
 from functools import partial
 
-from adaptive_margin import adaptive_ranking_loss
-from adaptive_margin import adaptive_ranking_loss
 from pretraining_networks import Vgg16, SiameseRankIQA, Resnet18, Resnet18SiameseRankIQA, SqueezeNet1_1, SqueezeNet1_1SiameseRankIQA
 
 from distortions_utils.distortions import gaussian_blur, lens_blur, motion_blur, jpeg, impulse_noise, multiplicative_noise, \
                         jitter, non_eccentricity_patch, pixelate, quantization, \
                         high_sharpen, linear_contrast_change, non_linear_contrast_change
-from adaptive_margin import adaptive_ranking_loss, compute_severity
+
+from adaptive_margin import compute_severity, adaptive_ranking_loss
 
 def set_global_seed(seed):
     random.seed(seed)
@@ -45,12 +46,6 @@ base_seed = 42
 set_global_seed(base_seed)
 
 TARGET_HW = 224
-
-# g_train = torch.Generator()
-# g_train.manual_seed(base_seed)
-
-# g_test = torch.Generator()
-# g_test.manual_seed(base_seed + 1)
 
 import torch.nn.functional as F
 
@@ -102,9 +97,6 @@ def random_patch_selection(h, w, crop_size=TARGET_HW):
 
     return top, left
 
-
-import torch.nn.functional as F
-
 def ensure_224(x):
     _, h, w = x.shape
 
@@ -114,42 +106,34 @@ def ensure_224(x):
         pad_w = max(0, 224 - w)
         x = F.pad(x, (0, pad_w, 0, pad_h))  # (left,right,top,bottom)
 
-    # # Se più grande → resize
-    # if x.shape[1] != 224 or x.shape[2] != 224:
-    #     x = F.interpolate(
-    #         x.unsqueeze(0),
-    #         size=(224, 224),
-    #         mode="bilinear",
-    #         align_corners=False
-    #     ).squeeze(0)
-
     return x
 
 ######## TORCHIVISION AUGMENTATIONS 
 distortion_range = {
-    "gaublur": [0.1, 0.5, 1, 2, 5],
-    "lensblur": [1, 2, 4, 6, 8],
-    "motionblur": [1, 2, 4, 6, 10],
+    "gaublur": [0.1, 0.5, 1, 2, 5],  # crescente
+    "lensblur": [1, 2, 4, 6, 8],  # crescente
+    "motionblur": [1, 2, 4, 6, 10],  # crescente
     # "colordiff": [1, 3, 6, 8, 12],
     # "colorshift": [1, 3, 6, 8, 12],
     # "colorsat1": [0.4, 0.2, 0.1, 0, -0.4],
     # "colorsat2": [1, 2, 3, 6, 9],
     # "jpeg2000": [16, 32, 45, 120, 170],
-    "jpeg": [43, 36, 24, 7, 4],
+    "jpeg": [43, 36, 24, 7, 4],  # decrescente
     # "whitenoise": [0.001, 0.002, 0.003, 0.005, 0.01],
     # "whitenoiseCC": [0.0001, 0.0005, 0.001, 0.002, 0.003],
-    "impulsenoise": [0.001, 0.005, 0.01, 0.02, 0.03],
-    "multnoise": [0.001, 0.005, 0.01, 0.02, 0.05],
+    "impulsenoise": [0.001, 0.005, 0.01, 0.02, 0.03],  # crescente
+    "multnoise": [0.001, 0.005, 0.01, 0.02, 0.05],  # crescente
     # "brighten": [0.1, 0.2, 0.4, 0.7, 1.1],
     # "darken": [0.05, 0.1, 0.2, 0.4, 0.8],
     # "meanshift": [0, 0.08, -0.08, 0.15, -0.15],
-    "jitter": [0.05, 0.1, 0.2, 0.5, 1],
-    "noneccpatch": [20, 40, 60, 80, 100],
-    "pixelate": [0.01, 0.05, 0.1, 0.2, 0.5],
-    "quantization": [20, 16, 13, 10, 7],
+    "jitter": [0.05, 0.1, 0.2, 0.5, 1],  # crescente
+    "noneccpatch": [20, 40, 60, 80, 100],  # crescente
+    "pixelate": [0.01, 0.05, 0.1, 0.2, 0.5],  # crescente
+    "quantization": [20, 16, 13, 10, 7],  # decrescente
     # "colorblock": [2, 4, 6, 8, 10],
-    "highsharpen": [1, 2, 3, 6, 12],
-    "lincontrchange": [0., 0.15, -0.4, 0.3, -0.6],
+    "highsharpen": [1, 2, 3, 6, 12],  # crescente
+    # "lincontrchange": [0., 0.15, -0.4, 0.3, -0.6],  # NON MONOTONO
+    "lincontrchange": [-0.6, -0.4, 0., 0.15,  0.3],  # crescente
     "nonlincontrchange": [0.4, 0.3, 0.2, 0.1, 0.05],
 }
 
@@ -198,127 +182,6 @@ distortion_functions = {
     "nonlincontrchange": non_linear_contrast_change,
 }
 
-# class Vgg16(nn.Module):
-#     def __init__(self, imagenet=None):
-#         super(Vgg16, self).__init__()
-
-#         if imagenet is not None:
-#             print("QUIIIII")
-#             model = vgg16(weights=VGG16_Weights.IMAGENET1K_V1)
-
-#             # cambia primo layer per input 1 canale
-#             # old_conv = model.features[0]
-#             # model.features[0] = nn.Conv2d(
-#             #     1,
-#             #     old_conv.out_channels,
-#             #     kernel_size=old_conv.kernel_size,
-#             #     stride=old_conv.stride,
-#             #     padding=old_conv.padding
-#             # )
-
-#             # # inizializza pesi facendo la media dei canali RGB
-#             # with torch.no_grad():
-#             #     model.features[0].weight[:] = old_conv.weight.mean(dim=1, keepdim=True)
-#         else:
-#             model = torchvision.models.vgg16(pretrained=False, num_classes=1)  # original code (for loading pretrained model on natural images)
-
-#             # model.features[0] = nn.Conv2d(
-#             #     1, 64, kernel_size=3, stride=1, padding=1
-#             # )
-
-#         self.features = torch.nn.Sequential(
-#             collections.OrderedDict(
-#                 zip(
-#                     [
-#                         'conv1_1', 'relu1_1', 'conv1_2', 'relu1_2', 'pool1',
-#                         'conv2_1', 'relu2_1', 'conv2_2', 'relu2_2', 'pool2',
-#                         'conv3_1', 'relu3_1', 'conv3_2', 'relu3_2', 'conv3_3', 'relu3_3', 'pool3',
-#                         'conv4_1', 'relu4_1', 'conv4_2', 'relu4_2', 'conv4_3', 'relu4_3', 'pool4',
-#                         'conv5_1', 'relu5_1', 'conv5_2', 'relu5_2', 'conv5_3', 'relu5_3', 'pool5'
-#                     ],
-#                     model.features
-#                 )
-#             )
-#         )
-
-#         self.classifier = torch.nn.Sequential(
-#             collections.OrderedDict(
-#                 zip(
-#                     ['fc6_m', 'relu6_m', 'drop6_m', 'fc7_m', 'relu7_m', 'drop7_m', 'fc8_m'],
-#                     model.classifier
-#                 )
-#             )
-#         )
-#         if imagenet is not None:
-#             self.classifier.fc8_m = nn.Linear(4096, 1)  
-
-#     def load_model(self, file, debug: bool = False):
-#         """
-#         Load model file.
-
-#         :param file: the model file to load.
-#         :param debug: indicate if output the debug info.
-#         """
-#         state_dict = torch.load(file)
-
-#         dict_to_load = dict()
-#         for k, v in state_dict.items():  # "v" is parameter and "k" is its name
-#             for l, p in self.named_parameters():  # "p" is parameter and "l" is its name
-#                 # use parameter's name to match state_dict's params and model's params
-#                 split_k, split_l = k.split('.'), l.split('.')
-#                 if (split_k[0] in split_l[1]) and (split_k[1] == split_l[2]):
-#                     dict_to_load[l] = torch.from_numpy(np.array(v)).view_as(p)
-#                     if debug:  # output debug info
-#                         print(f"match: {split_k} and {split_l}.")
-
-#         self.load_state_dict(dict_to_load)
-
-#     def forward(self, x):
-#         out = self.features(x)
-#         out = torch.flatten(out, start_dim=1, end_dim=-1)  # dont use adaptive avg pooling
-#         out = self.classifier(out)
-#         return out
-
-# class VGGFeatureExtractor(nn.Module):
-#     def __init__(self, vgg):
-#         super().__init__()
-#         self.features = vgg.features
-
-#     def forward(self, x):
-#         f = self.features(x)              # [B, 512, H, W]
-#         return f
-
-# class RankIQA_branch(nn.Module):
-#     def __init__(self, vgg_model):
-#         super().__init__()
-#         self.features = VGGFeatureExtractor(vgg_model)  # conv layers of VGG16
-        
-#         self.head = nn.Sequential(
-#             nn.Flatten(),
-#             nn.Linear(512 * 7 * 7, 4096),
-#             nn.ReLU(inplace=True),
-#             nn.Dropout(0.5),
-#             nn.Linear(4096, 4096),
-#             nn.ReLU(inplace=True),
-#             nn.Dropout(0.5),
-#             nn.Linear(4096, 1)  # scalar score
-#         )
-
-#     def forward(self, x):
-#         feats = self.features(x)
-#         score = self.head(feats)
-#         return score
-
-# class SiameseRankIQA(nn.Module):
-#     def __init__(self, vgg_model):
-#         super().__init__()
-#         self.scorer = RankIQA_branch(vgg_model)
-
-#     def forward(self, x, x_hat):
-#         s = self.scorer(x)
-#         s_hat = self.scorer(x_hat)
-#         return s, s_hat
-
 # def ranking_loss(s, s_hat, y, margin=0.5):  # y ...
 #     # y = 0 --> s > s_hat
 
@@ -330,9 +193,6 @@ distortion_functions = {
 #     # # loss = torch.clamp(((2*y - 1) * diff) + margin, min=0)
 #     # loss = torch.clamp(diff + margin, min=0)
 #     return loss.mean()
-
-
-# # loss = torch.clamp(margin - y * (s - s_hat), min=0).mean()
 
 # def ranking_accuracy(s, s_hat, y):
 #     # s, s_hat: [B, 1]
@@ -471,6 +331,7 @@ class BaseDataset(Dataset):
         
         self.streak_levels = [1, 6, 12]
         self.noise_levels = [0.1, 0.5, 1.0]
+        
         self.artifact_dict = defaultdict(list)
         self.artifact_class_to_indices = defaultdict(lambda: defaultdict(list))
             
@@ -548,6 +409,7 @@ def random_crop(x, x_hat, cm='random'):
         crop_mode = "same" if random.random() <= 0.5 else "different"
     else:
         crop_mode = 'same'
+
     ### random patch
     h, w = x.shape[1], x.shape[2]  # x [1, H, W]
     
@@ -569,17 +431,6 @@ def random_crop(x, x_hat, cm='random'):
     x_hat_crop = ensure_224(x_hat_crop)
 
     return x_crop, x_hat_crop
-
-
-# class IndexDataset(torch.utils.data.Dataset):
-#     def __init__(self, base_dataset):
-#         self.base = base_dataset
-
-#     def __len__(self):
-#         return len(self.base)
-
-#     def __getitem__(self, idx):
-#         return idx
 
 
 class BalancedBatchSampler(torch.utils.data.Sampler):
@@ -607,6 +458,59 @@ class BalancedBatchSampler(torch.utils.data.Sampler):
     def __len__(self):
         return self.num_batches
 
+#### curriculum batch sampler 
+class CurriculumBalancedBatchSampler(torch.utils.data.Sampler):
+    def __init__(self, dataset_len, schedule, batch_size):
+        """
+        dataset_len: int -> lunghezza del dataset di base
+        schedule: dict -> {epoca: [lista_tipi_coppia_attivi]}
+                           es: {0: ['fd_vs_syn'], 5: ['fd_vs_syn', 'syn_vs_syn_easy'], 10: all}
+        batch_size: int -> dimensione finale desiderata del batch (es. 120)
+        """
+        self.dataset_len = dataset_len
+        self.schedule = schedule
+        self.batch_size = batch_size
+        self.num_batches = dataset_len // batch_size
+        
+        # Inizializzazione allo stato dell'epoca 0
+        self.epoch = 0
+        self._update_active_types()
+
+    def _update_active_types(self):
+        # Determina quali tipi di coppie sono attivi per l'epoca corrente
+        milestones = sorted([k for k in self.schedule.keys() if k <= self.epoch])
+        latest_milestone = milestones[-1]
+        self.active_pair_types = self.schedule[latest_milestone]
+        
+        # Bilancia dinamicamente il batch in base a quanti tipi sono attivi
+        num_active = len(self.active_pair_types)
+        assert self.batch_size % num_active == 0, \
+            f"Errore: batch_size ({self.batch_size}) non divisibile per il numero di coppie attive ({num_active}) all'epoca {self.epoch}"
+        
+        self.per_type = self.batch_size // num_active
+        print(f"\n[Curriculum] Epoca {self.epoch} -> Tipi Attivi: {self.active_pair_types} | Esempi per tipo nel batch: {self.per_type}")
+
+    def set_epoch(self, epoch):
+        """Metodo da chiamare all'inizio di ogni epoca nel loop di training"""
+        self.epoch = epoch
+        self._update_active_types()
+
+    def __iter__(self):
+        for _ in range(self.num_batches):
+            batch = []
+            # Campiona solo dai tipi attivi in questa epoca
+            for t in self.active_pair_types:
+                for _ in range(self.per_type):
+                    idx = random.randint(0, self.dataset_len - 1)
+                    batch.append((idx, t))
+
+            # Rimescola l'ordine interno del batch per non avere tutte le coppie dello stesso tipo vicine
+            random.shuffle(batch)
+            yield batch
+
+    def __len__(self):
+        return self.num_batches
+
 class PairGenerator:
     def __call__(self, dataset, idx):
         raise NotImplementedError
@@ -616,37 +520,37 @@ class FDvsLD:
     def __call__(self, dataset, idx):
         x = dataset.load_fd(idx)
 
-        idx_1 = dataset.sample_idx_pair(idx)  # campiono l'altro indice (stesso paziente o diverso paziente)
+        # idx_1 = dataset.sample_idx_pair(idx)  # campiono l'altro indice (stesso paziente o diverso paziente)
 
-        x_hat = dataset.load_ld(idx_1)
+        # x_hat = dataset.load_ld(idx_1)
 
         ## se voglio fare stesso confronto 
-        # x_hat = dataset.load_ld(idx)
+        x_hat = dataset.load_ld(idx)
 
         # return x, x_hat, {"type": "fd_ld"}  # quality(x) > quality(x_hat)
         return x, x_hat, {"type": "fd_ld",
                           "art_i": 'fd', 'level_i': -1, 'level_idx_i': -1,
                           "art_j": 'ld', 'level_j': -1, 'level_idx_j': -1,
-                          "quality_label": 1}  # x_hat low quality with respect to x
+                          "quality_label": 1}  # x_hat low quality with respect to x  
 
 ## x vs x_hat synthetic (uso torchvision ora)
 class FDvsSynthetic(PairGenerator):
     def __call__(self, dataset, idx):
         x = dataset.load_fd(idx)
 
-        idx_1 = dataset.sample_idx_pair(idx)  # campiono l'altro indice (stesso paziente o diverso paziente)
-        x1 = dataset.load_fd(idx_1)
+        # idx_1 = dataset.sample_idx_pair(idx)  # campiono l'altro indice (stesso paziente o diverso paziente)
+        # x1 = dataset.load_fd(idx_1)
 
         # applico artefatto random su x1 
         # art, level = sample_degradation_(distortion_range)
         art, level, level_idx = sample_degradation_(distortion_range)
-        x_hat = build_degradation_(artefatto=art, livello=level)(x1)
+        # x_hat = build_degradation_(artefatto=art, livello=level)(x1)
 
         ## se voglio fare stesso confronto 
-        # x_hat = build_degradation_(artefatto=art, livello=level)(x) 
+        x_hat = build_degradation_(artefatto=art, livello=level)(x) 
         # e commento idx_1, x1
 
-        # return x, x_hat, {"type": "fd_syn", "art": art, 'level': level}  # quality(x) > quality(x_hat)
+        # return x, x_hat, {"type": "fd_syn", "art": art, 'level': level, 'level_idx': level_idx}  # quality(x) > quality(x_hat)
         return x, x_hat, {"type": "fd_syn", 
                           "art_i": 'fd', 'level_i': -1, 'level_idx_i': -1,
                           "art_j": art, 'level_j': level, 'level_idx_j': level_idx,
@@ -664,6 +568,8 @@ class FDvsReal(PairGenerator):
         streak_val, noise_val = re.search(r"streak_(\d+)_noise_([0-9]*\.?[0-9]+)", comb).groups() 
         level_j = int(streak_val) + float(noise_val)
         level_idx_j = dataset.arts_levels.index(comb)
+
+        # TODO: come potrei fare per rendere il confronto più corretto (confronto con una slice più vicina possibile a quella che ho preso) possibile ?
 
         idx_1 = dataset.sample_idx_pair_real(idx, comb)  # campiono l'altro indice (stesso paziente o diverso paziente)
 
@@ -694,7 +600,6 @@ class SynVsSyn(PairGenerator):
 
         # art1, level_x1_hat = sample_degradation_(distortion_range)
         art1, level_x1_hat, level_idx_x1_hat = sample_degradation_(distortion_range)
-
         # applico l'artefatto campionato a x
         x1_hat = build_degradation_(artefatto=art1, livello=level_x1_hat)(x)
 
@@ -711,20 +616,17 @@ class SynVsSyn(PairGenerator):
             parametri=distortion_range
         )
 
-        idx_1 = dataset.sample_idx_pair(idx)  # campiono l'altro indice (stesso paziente o diverso paziente)
-        x2 = dataset.load_fd(idx_1)
-        # applico l'artefatto campionato a x2
-        x2_hat = build_degradation_(artefatto=art1, livello=level_x2_hat)(x2)
-
-        ## se voglio stesso confronto x1_hat e x2_hat devono generarsi entrambe da x2
+        ## se voglio stesso confronto x1_hat e x2_hat devono generarsi entrambe da x
+        x2_hat = build_degradation_(artefatto=art1, livello=level_x2_hat)(x)
 
         # return x1_hat, x2_hat, {"type": "syn_syn", "art1": art1,
-        #                          "level_x1_hat": level_x1_hat, "level_x2_hat": level_x2_hat, "quality_label": quality_label} # quality_label
+        #                          "level_x1_hat": level_x1_hat, "level_x2_hat": level_x2_hat, "quality_label": quality_label,
+        #                          "level_idx_x1_hat": level_idx_x1_hat, "level_idx_x2_hat": level_idx_x2_hat} # quality_label
+
         return x1_hat, x2_hat, {"type": "syn_syn", 
                                 "art_i": art1, "level_i": level_x1_hat, "level_idx_i": level_idx_x1_hat,
                                 "art_j": art1, "level_j": level_x2_hat, "level_idx_j": level_idx_x2_hat,
                                 "quality_label": quality_label} # quality_label
-
 
 ## x_hat_1 vs x_hat 2 real
 class RealVsReal(PairGenerator):
@@ -762,11 +664,6 @@ class RealVsReal(PairGenerator):
             if float(noise_val2) > float(noise_val1):  # maggiore è il noise, minore è la qualità
                 quality_label = 1  # x2_hat low quality with respect to x1_hat
 
-
-            # quality_label = 0
-            # if float(noise_val2) < float(noise_val1):  # minore è il noise, minore è la qualità
-            #     quality_label = 1  # x2_hat low quality with respect to x1_hat
-
         else:
             # same noise, diff streak
             candidati = []
@@ -791,35 +688,20 @@ class RealVsReal(PairGenerator):
             quality_label = 0
             if int(streak_val2) > int(streak_val1):  # maggiore è lo streak, minore è la qualità
                 quality_label = 1 # # x2_hat low quality with respect to x1_hat
-
-            # quality_label = 0
-            # if int(streak_val2) > int(streak_val1):  # maggiore è lo streak, minore è la qualità
-            #     quality_label = 1 # # x2_hat low quality with respect to x1_hat
         ####
 
         # sample slices
         # la slice in realtà la cambio (l'originale non va bene - devo prendere una con l'artefatto che non avrà lo stesso indice)
 
-        idx_1, idx_2 = dataset.sample_idx_pair_real_real(idx, comb1, comb2)
-        img_path_1 = dataset.artifact_dict[comb1][idx_1]
-        img_path_2 = dataset.artifact_dict[comb2][idx_2]
-
-        # idx1 = random.choice(dataset.artifact_class_to_indices[comb1][label])
-        # img_path_1 = dataset.artifact_dict[comb1][idx1]
-
-        # # stesso paziente/diverso paziente 
-        # r = random.random()
-        # if r <= 0.5:
-        #     # stesso paziente - 
-        #     idx_2 = random.choice(dataset.artifact_class_to_indices[comb2][label])  # una slice a caso dello stesso paziente
-
-        # else:
-        #     # diverso paziente 
-        #     neg_label = random.choice([l for l in dataset.patients if l != label])  # un paziente diverso 
-
-        #     idx_2 = random.choice(dataset.artifact_class_to_indices[comb2][neg_label])  # una slice a caso dello stesso paziente
-        
+        # idx_1, idx_2 = dataset.sample_idx_pair_real_real(idx, comb1, comb2)
+        # img_path_1 = dataset.artifact_dict[comb1][idx_1]
         # img_path_2 = dataset.artifact_dict[comb2][idx_2]
+
+        # in realtà posso usare un'indice unico per real vs real (sono mappabili una volta trasformate ...dovrebbero)
+        # posso campionare un solo indice 
+        idx_1 = dataset.sample_idx_pair_real(idx, comb1)  
+        img_path_1 = dataset.artifact_dict[comb1][idx_1]
+        img_path_2 = dataset.artifact_dict[comb2][idx_1]
 
         x1_hat = np.load(img_path_1).astype(np.float32)
         x2_hat = np.load(img_path_2).astype(np.float32)
@@ -829,13 +711,13 @@ class RealVsReal(PairGenerator):
 
         # return x1_hat, x2_hat, {"type": "real_real", "comb1": comb1,
         #                          "comb2": comb2, "quality_label": quality_label} 
-
         return x1_hat, x2_hat, {"type": "real_real", 
                                 "art_i": comb1, 'level_i': level_i, 'level_idx_i': level_idx_i,
                                 "art_j": comb2, 'level_j': level_j, 'level_idx_j': level_idx_j, 
                                 "quality_label": quality_label} 
 
-# def build_label(meta):
+# # TODO: modifica ... se metto per tutti quality label in meta, non devo distinguere  
+# def build_label(meta): 
 #     t = meta["type"]
 
 #     if t in ["fd_ld", "fd_syn", "fd_real"]:
@@ -851,17 +733,19 @@ class RealVsReal(PairGenerator):
 #         raise ValueError(t)
     
 def apply_random_swap(x, x_hat, y):
+    # y = random.randint(0, 1)
+    # if y == 0:
+    #     print("No swap applied")
+    #     return x, x_hat, y
+    # else:
+    #     print("Swap applied")
+    #     return x_hat, x, y
+
     if random.random() < 0.5:
         # print("Swap applied")
         return x_hat, x, 1 - y
     
     return x, x_hat, y
-
-    # y = random.randint(0, 1)
-    # if y == 0:
-    #     return x, x_hat, y
-    # else:
-    #     return x_hat, x, y
 
 class RankIQADataset(Dataset):
     def __init__(self, base_dataset, generators, pair_types, rescaling_fn, cm):
@@ -887,6 +771,7 @@ class RankIQADataset(Dataset):
         
         # 3. Crop and Swap
         x, x_hat = random_crop(x, x_hat, cm=self.cm)
+        # print("Before swap: y =", y)
         x, x_hat, y = apply_random_swap(x, x_hat, y)
 
         if x.shape[0] == 1:
@@ -898,11 +783,18 @@ class RankIQADataset(Dataset):
             x_hat = self.rescaling_fn(x_hat)
             
         # return x, x_hat, torch.tensor(y, dtype=torch.float32), t
-        return x, x_hat, torch.tensor(y, dtype=torch.float32), t, meta
+        return x, x_hat, torch.tensor(y, dtype=torch.float32), t, meta  # ADDED
 
 @torch.no_grad()
 def evaluate_detailed(model, loader, device, experiment, epoch, margin):
     model.eval()
+
+    # TODO: sistema
+    # m0=0.1
+    # alpha=0.3
+    # gamma=2.0
+    # m0=0.0
+    # alpha=1.0
     
     # Dizionari per accumulare metriche divise per tipo
     metrics_by_type = {t: {'loss': [], 'acc': []} for t in loader.dataset.pair_types}
@@ -914,23 +806,43 @@ def evaluate_detailed(model, loader, device, experiment, epoch, margin):
         s, s_hat = model(x, x_hat)
         
         # Calcolo loss e acc per l'intero batch
-        # Nota: usiamo reduction='none' per avere il valore singolo per ogni elemento del batch
         diff = s - s_hat
         target = (1 - 2 * y) 
 
-        # hinge loss
-        # losses = torch.clamp((target * diff) + margin, min=0)
+        ## hinge loss
+        # losses = torch.clamp(((2*y - 1) * diff) + margin, min=0)
+        # losses = torch.clamp((target * diff) + margin, min=0)  
 
-        # soft
-        losses = torch.nn.functional.softplus(target * diff)
+        ## soft
+        # losses = torch.nn.functional.softplus(target * diff)
 
-        # # adaptive logistic loss
-        # alpha = 2.0
-        # sev_i, sev_j = compute_severity(meta=meta, distortion_range=distortion_range, device=device)
-        # delta = torch.abs(sev_i - sev_j)
-        # expo = alpha * delta * target * diff
-        # losses = torch.log(1 + torch.exp(expo))
+        ## adaptive loss
+        alpha = 2.0
+        severity_i, severity_j = compute_severity(meta=meta, distortion_range=distortion_range, real_arts_levels=loader.dataset.base.arts_levels, real_streak_levels=loader.dataset.base.streak_levels, real_noise_levels=loader.dataset.base.noise_levels, device=device)
+        delta = torch.abs(severity_i - severity_j)
+        expo = alpha * delta * target * diff
+        losses = torch.log(1 + torch.exp(expo))
 
+
+        # ## NEW
+        # severity_i, severity_j = compute_severity(meta=meta, distortion_range=distortion_range, device=device)
+
+        # ####  adaptive_ranking_loss(s, s_hat, y, severity_i, severity_j)  # no perchè fa .mean()
+        # delta = torch.abs(severity_i - severity_j)
+        # # marg = m0 + alpha * delta
+        # # # weight = torch.exp(-gamma * delta)
+        # # losses = torch.clamp(((2*y - 1) * diff) + marg, min=0)
+        # # losses = weight * losses
+        # ####
+
+        # #####  DA ALLINEARE CON diff e target 
+        # # target = (2 * y - 1) 
+        # # losses = torch.log(1 + torch.exp(-alpha * delta * target * diff))
+        # losses =  torch.nn.functional.softplus(-target * diff * (1 + delta))
+        # #####
+
+        # accs = ((2 * y - 1) * (s_hat - s) > 0).float()  # NO 
+        # accs = ((1 - 2*y) * (s_hat - s) > 0).float()  # OK 
         accs = (-target * diff > 0).float()  # OK per allinearsi a diff e target 
 
         # Distribuiamo i risultati nei bucket corretti
@@ -938,7 +850,7 @@ def evaluate_detailed(model, loader, device, experiment, epoch, margin):
             metrics_by_type[t]['loss'].append(losses[i].item())
             metrics_by_type[t]['acc'].append(accs[i].item())
 
-    # Logghiamo i risultati su Comet
+    # logs
     total_acc = []
     total_loss = []
     for t, results in metrics_by_type.items():
@@ -966,9 +878,9 @@ if __name__ == '__main__':
     # comet parameters
     parser.add_argument("--comet", dest="comet", default=1, help="1 for comet ON, 0 for comet OFF")
     parser.add_argument("--name_proj", dest="name_proj", default='medrank-iqa-pretraining-new', help="define comet ml project folder")
-    parser.add_argument("--name_exp", dest="name_exp", default='full_syn_real_balanced_v1', help="name of comet ml experiment")
+    parser.add_argument("--name_exp", dest="name_exp", default='tmp', help="name of comet ml experiment")
 
-    parser.add_argument("--batch_size", dest="batch_size", default=125, help="batch size for train and test")
+    parser.add_argument("--batch_size", dest="batch_size", default=5, help="batch size for train and test")
 
     parser.add_argument('--device_id', dest="device_id",  default='0', help='gpu device id.')
     parser.add_argument("--learning_rate", dest="learning_rate", type=float, default=1e-3, help="base learning rate")
@@ -983,7 +895,8 @@ if __name__ == '__main__':
     #                 help='test case for pair combination. all, all_same, synthetic, low_dose, same_artifact_diff_levels.')
     parser.add_argument('--margin', dest="margin",  default=0.5, help='margin for ranking loss')
 
-    parser.add_argument('--network_model', dest="network_model",  default='vgg16', help='specify the network to use. vgg16, resnet18')
+    parser.add_argument('--network_model', dest="network_model",  default='squeezenet1_1', help='specify the network to use. vgg16, resnet18')
+
     parser.add_argument('--crop_mode', dest="crop_mode",  default='same', help='same or random (compare same or different patches in the pair)')
 
     args = parser.parse_args()
@@ -1051,11 +964,15 @@ if __name__ == '__main__':
     print(f"Total parameters: {total_params}")
     print(f"Trainable parameters: {trainable_params}")
 
+    # optim = Adam(model.parameters(), lr=float(args.learning_rate))
     optim = Adam(model.parameters(), lr=float(args.learning_rate), weight_decay=1e-4)
 
     #### new 
     pair_types = ["fd_ld", "fd_syn", "fd_real", "syn_syn", "real_real"]
     # pair_types = ["fd_ld", "fd_syn", "fd_real"]
+    # pair_types = ["fd_ld", "fd_syn"]
+    # pair_types = ["fd_syn", "syn_syn"]
+    # pair_types = ["syn_syn"]
 
     # Dataset
     generators = {
@@ -1075,7 +992,28 @@ if __name__ == '__main__':
     test_ds = RankIQADataset(base_test, generators, pair_types, rescaling_fn, cm=args.crop_mode)
 
     # Samplers
-    train_sampler = BalancedBatchSampler(len(train_ds), pair_types, int(args.batch_size))
+    # train_sampler = BalancedBatchSampler(len(train_ds), pair_types, int(args.batch_size))
+
+    # train_schedule = {
+    #     0:  ['fd_vs_syn_heavy'],
+    #     3:  ['fd_vs_syn_heavy', 'fd_vs_syn_all'],
+    #     6:  ['fd_vs_syn_heavy', 'fd_vs_syn_all', 'syn_vs_syn_distant'],
+    #     9:  ['fd_vs_syn_heavy', 'fd_vs_syn_all', 'syn_vs_syn_distant', 'syn_vs_syn_close']
+    # }
+    train_schedule = {
+        0:  ['fd_ld'],
+        3:  ['fd_ld', 'fd_real'],
+        7:  ['fd_ld', 'fd_real', 'fd_syn'],
+        10:  ['fd_ld', 'fd_real', 'fd_syn', 'syn_syn'],
+        13:  ['fd_ld', 'fd_real', 'fd_syn', 'syn_syn', 'real_real'],
+    }
+
+    train_sampler = CurriculumBalancedBatchSampler(
+        dataset_len=len(train_ds),
+        schedule=train_schedule,
+        batch_size=int(args.batch_size)
+    )
+
     # test - campionamento bilanciato o random...
     test_sampler = BalancedBatchSampler(len(test_ds), pair_types, int(args.batch_size))
 
@@ -1090,6 +1028,10 @@ if __name__ == '__main__':
         train_losses = []
 
         with tqdm(train_loader, leave=False, desc="Training") as t:
+
+            # Riconfigura il bilanciamento interno del batch all'inizio di ogni epoca
+            train_loader.batch_sampler.set_epoch(epoch)
+
             # for x, x_hat, y, pair_types in t:
             for x, x_hat, y, pair_types, meta in t:
                 x, x_hat, y = x.to(device), x_hat.to(device), y.unsqueeze(1).to(device)  # y è B --> lo rendo B, 1
@@ -1097,11 +1039,13 @@ if __name__ == '__main__':
                 optim.zero_grad()
                 s, s_hat = model(x, x_hat) # B, 1 and B,1
 
-                loss = ranking_loss(s, s_hat, y, margin=float(args.margin))
+                # loss = ranking_loss(s, s_hat, y, margin=float(args.margin))
 
-                # ## margine adattivo
-                # severity_i, severity_j = compute_severity(meta=meta, distortion_range=distortion_range, device=device)
-                # loss = adaptive_ranking_loss(s, s_hat, y, severity_i, severity_j)
+                ## NEW
+                severity_i, severity_j = compute_severity(meta=meta, distortion_range=distortion_range, real_arts_levels=train_loader.dataset.base.arts_levels, real_streak_levels=train_loader.dataset.base.streak_levels, real_noise_levels=train_loader.dataset.base.noise_levels, device=device)
+                loss = adaptive_ranking_loss(s, s_hat, y, severity_i, severity_j)
+
+                # t.set_postfix(loss=loss.item())
 
                 with torch.no_grad():
                     s_mean = s.mean().item()
@@ -1111,8 +1055,6 @@ if __name__ == '__main__':
                     # Calcoliamo al volo l'accuracy del batch per monitorarla
                     acc = ranking_accuracy(s, s_hat, y).item()
 
-                # t.set_postfix(loss=loss.item())
-                
                 # Aggiorna la barra tqdm mostrando loss, accuracy e scala dei punteggi
                 t.set_postfix(
                     loss=f"{loss.item():.4f}",
@@ -1123,7 +1065,7 @@ if __name__ == '__main__':
                 )
                 
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                 optim.step()
                 
                 train_losses.append(loss.item())
@@ -1133,202 +1075,8 @@ if __name__ == '__main__':
 
         ## test
         evaluate_detailed(model, test_loader, device, experiment, epoch, float(args.margin))
-        
-        # model.eval()
-        # test_accuracies = []
-        # test_losses = []
-        # with tqdm(test_loader, leave=False, desc="Test") as t:
-        #     for x, x_hat, y in t:
-        #         x, x_hat, y = x.to(device), x_hat.to(device), y.to(device)
-
-        #         with torch.no_grad():
-        #             s, s_hat = model(x, x_hat)
-    
-        #         loss = ranking_loss(s, s_hat, y)
-        #         t.set_postfix(loss=loss.item())
-        #         test_losses.append(loss.item())
-                
-        #         accuracy = ranking_accuracy(s, s_hat, y)
-        #         test_accuracies.append(accuracy.item())
-        
-        # test_loss_mean = np.mean(test_losses)
-        # test_acc_mean  = np.mean(test_accuracies)     
-        # print(f"Epoch {epoch+1} - Test Accuracy: {test_acc_mean:.4f}, Test Loss: {test_loss_mean:.4f}")
-
-        # experiment.log_metric("test_loss", test_loss_mean, step=epoch)
-        # experiment.log_metric("test_accuracy", test_acc_mean, step=epoch)  
 
 
     torch.save(model.state_dict(), os.path.join(base_pretrained_folder, save_file_name + '.pth')) # per salvare il modello
     # log model ? 
     experiment.end()
-
-
-
-    ##############################################################
-    # generators = {
-    #     "fd_ld": FDvsLD(),
-    #     "fd_syn": FDvsSynthetic(),
-    #     "fd_real": FDvsReal(),
-    #     "syn_syn": SynVsSyn(),
-    #     "real_real": RealVsReal(),
-    # }
-
-    # base_dataset = BaseDataset(mode="train")
-    # index_dataset = IndexDataset(base_dataset)  # ha get_item 
-
-    # sampler = BalancedBatchSampler(
-    #     dataset_len=len(base_dataset),
-    #     pair_types=pair_types,
-    #     batch_size=int(args.batch_size)
-    # )
-
-    # ## test
-    # base_test_dataset = BaseDataset(mode='test')
-    # index_test_dataset = IndexDataset(base_test_dataset)
-
-    # test_generators = {
-    #     "fd_ld": FDvsLD(),
-    #     "fd_syn": FDvsSynthetic(),
-    #     "fd_real": FDvsReal(),
-    #     "syn_syn": SynVsSyn(),
-    #     "real_real": RealVsReal(),
-    # }
-
-    # ##
-    # vgg = Vgg16(imagenet=args.imagenet_initialization)
-    # model = SiameseRankIQA(vgg_model=vgg)
-    # model.to(device)
-    
-    # # Total parameters
-    # total_params = sum(p.numel() for p in model.parameters())
-    # # Trainable parameters
-    # trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
-    # print(f"Total parameters: {total_params}")
-    # print(f"Trainable parameters: {trainable_params}")
-
-    # optim = Adam(model.parameters(), lr=float(args.learning_rate))
-
-
-    # ## training loop 
-    # for epoch in range(args.n_epochs):
-
-    #     model.train()
-    #     train_losses = []
-
-    #     for batch in sampler:
-
-    #         x_list, xhat_list, y_list = [], [], []
-
-    #         for idx, t in batch:
-    #             gen = generators[t]
-
-    #             x, x_hat, meta = gen(base_dataset, idx)
-
-    #             y = build_label(meta)
-
-    #             # random crop
-    #             x, x_hat = random_crop(x, x_hat)  # 1, H, W
-
-    #             x, x_hat, y = apply_random_swap(x, x_hat, y)
-
-    #             x = x.to(device)  
-    #             x_hat = x_hat.to(device)
-    #             # non serve unsqueeze(0) perchè faccio append
-
-    #             # expand channels if needed
-    #             # if x.size(1) == 1:
-    #             #     x = x.repeat(1, 3, 1, 1)
-    #             #     x_hat = x_hat.repeat(1, 3, 1, 1)
-
-    #             if x.size(0) == 1:
-    #                 x = x.repeat(3, 1, 1)
-    #                 x_hat = x_hat.repeat(3, 1, 1)
-
-    #             x = rescaling_fn(x)
-    #             x_hat = rescaling_fn(x_hat)
-
-    #             x_list.append(x)
-    #             xhat_list.append(x_hat)
-    #             y_list.append(y)
-
-    #         x = torch.stack(x_list)  # B, 3, H, W
-    #         x_hat = torch.stack(xhat_list)
-    #         y = torch.tensor(y_list).to(device)  # B
-
-    #         # forward
-    #         s, s_hat = model(x, x_hat)
-
-    #         loss = ranking_loss(s, s_hat, y)
-
-    #         optim.zero_grad()
-    #         loss.backward()
-    #         optim.step()
-
-    #         train_losses.append(loss.item())
-
-    #     train_loss_mean = float(np.mean(train_losses))
-    #     experiment.log_metric("train_loss", train_loss_mean, step=epoch)
-    #     print(f"Epoch {epoch+1} - Train Loss: {train_loss_mean:.4f}")
-
-    #     ## test
-    #     model.eval()
-    #     test_accuracies = []
-    #     test_losses = []
-    #     for t in pair_types:
-
-    #         gen = test_generators[t]
-
-    #         current_loader_accuracies = []
-    #         current_loader_losses = []
-
-    #         for idx in range(len(base_test_dataset)):
-
-    #             x, x_hat, meta = gen(base_test_dataset, idx)
-    #             y = build_label(meta)
-
-    #             # random crop
-    #             x, x_hat = random_crop(x, x_hat)
-
-    #             x = x.unsqueeze(0).to(device)  # 1, 1, H, W
-    #             x_hat = x_hat.unsqueeze(0).to(device)
-    #             y = torch.tensor([y]).to(device)
-
-    #             if x.size(1) == 1:
-    #                 x = x.repeat(1, 3, 1, 1)
-    #                 x_hat = x_hat.repeat(1, 3, 1, 1)
-
-    #             x = rescaling_fn(x)
-    #             x_hat = rescaling_fn(x_hat)
-
-    #             with torch.no_grad():
-    #                 s, s_hat = model(x, x_hat)
-
-    #             loss = ranking_loss(s, s_hat, y)
-    #             acc = ranking_accuracy(s, s_hat, y)
-
-    #             current_loader_losses.append(loss.item())
-    #             current_loader_accuracies.append(acc.item())
-
-    #             test_losses.append(loss.item())
-    #             test_accuracies.append(acc.item())
-
-    #         current_loader_loss_mean = np.mean(current_loader_losses)
-    #         current_loader_acc_mean  = np.mean(current_loader_accuracies)
-
-    #         experiment.log_metric(f"test_{t}_loss", current_loader_loss_mean, step=epoch)
-    #         experiment.log_metric(f"test_{t}_accuracy", current_loader_acc_mean, step=epoch)
-
-    #     test_loss_mean = np.mean(test_losses)
-    #     test_acc_mean  = np.mean(test_accuracies)
-
-    #     print(f"Epoch {epoch+1} - Test Accuracy: {test_acc_mean:.4f}, Test Loss: {test_loss_mean:.4f}")
-
-    #     experiment.log_metric("test_loss", test_loss_mean, step=epoch)
-    #     experiment.log_metric("test_accuracy", test_acc_mean, step=epoch)
-
-    # # TODO: dovrei selezionare il modello migliore su un validation set ...
-    # torch.save(model.state_dict(), os.path.join(base_pretrained_folder, save_file_name + '.pth')) # per salvare il modello
-    # # log model ? 
-    # experiment.end()

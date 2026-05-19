@@ -261,6 +261,12 @@ class SqueezeNet1_1RankIQA_branch(nn.Module):
         )
 
         # self.head = nn.Sequential(
+        #     nn.AdaptiveAvgPool2d((1, 1)),
+        #     nn.Flatten(),
+        #     nn.Linear(512, 1)
+        # )
+
+        # self.head = nn.Sequential(
         #     nn.Conv2d(512, 1, kernel_size=1),
         #     nn.AdaptiveAvgPool2d((1, 1)),
         #     nn.Flatten()  # → [B, 1]

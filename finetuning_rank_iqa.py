@@ -374,7 +374,8 @@ if __name__ == '__main__':
         "n_finetuning": None if args.n_finetuning is None else int(args.n_finetuning),
         "pretrained_file_path": None if args.file_path is None else str(args.file_path),
         "imagenet_initialization": args.imagenet_initialization,
-        "network_model": args.network_model
+        "network_model": args.network_model,
+        "pretrained_file_path": None if args.file_path is None else str(args.file_path),
     })
 
     optim_backbone_freeze = args.finetune_backbone_freeze_epochs
