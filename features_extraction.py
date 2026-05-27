@@ -53,6 +53,7 @@ class FineTuningDictDataset(Dataset):
 
         self.loader_tif = LoadImage(image_only=True, reader="PILReader")
         self.loader_dcm = LoadImage(image_only=True, reader=PydicomReader)
+        self.loader_fallback = LoadImage(image_only=True)
 
         self.return_path = return_path
 
@@ -69,19 +70,27 @@ class FineTuningDictDataset(Dataset):
         with open(self.otsu_crop_file) as f:
             self.otsu_crops = json.load(f)
 
-        def _load_to_cd_hw(p: str) -> np.ndarray:
-            plower = p.lower()
-            if plower.endswith((".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp")):
-                x = self.loader_tif(p)
-            elif plower.endswith(".dcm"):
-                x = self.loader_dcm(p)
-            else:
-                # fallback: autodetect
-                x = LoadImage(image_only=True)(p)
+        # def _load_to_cd_hw(p: str) -> np.ndarray:
+        #     plower = p.lower()
+        #     if plower.endswith((".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp")):
+        #         x = self.loader_tif(p)
+        #     elif plower.endswith(".dcm"):
+        #         x = self.loader_dcm(p)
+        #     else:
+        #         # fallback: autodetect
+        #         x = LoadImage(image_only=True)(p)
 
-            return x
+        #     return x
 
-        self.load = Lambda(func=_load_to_cd_hw)
+        # self.load = Lambda(func=_load_to_cd_hw)
+    
+    def _load_image(self, p: str):
+        plower = p.lower()
+        if plower.endswith((".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp")):
+            return self.loader_tif(p)
+        elif plower.endswith(".dcm"):
+            return self.loader_dcm(p)
+        return self.loader_fallback(p)
 
     def __len__(self):
         return len(self.items)
@@ -89,7 +98,8 @@ class FineTuningDictDataset(Dataset):
     def __getitem__(self, idx):
         img_path, score = self.items[idx]
 
-        image = self.load(img_path) 
+        # image = self.load(img_path) 
+        image = self._load_image(img_path)
 
         ## retrieve corresponding otsu crop
         minr, minc, maxr, maxc = self.otsu_crops[img_path]

@@ -54,6 +54,7 @@ class FineTuningDictDataset(Dataset):
 
         self.loader_tif = LoadImage(image_only=True, reader="PILReader")
         self.loader_dcm = LoadImage(image_only=True, reader=PydicomReader)
+        self.loader_fallback = LoadImage(image_only=True)
 
         self.return_path = return_path
 
@@ -70,19 +71,27 @@ class FineTuningDictDataset(Dataset):
         with open(self.otsu_crop_file) as f:
             self.otsu_crops = json.load(f)
 
-        def _load_to_cd_hw(p: str) -> np.ndarray:
-            plower = p.lower()
-            if plower.endswith((".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp")):
-                x = self.loader_tif(p)
-            elif plower.endswith(".dcm"):
-                x = self.loader_dcm(p)
-            else:
-                # fallback: autodetect
-                x = LoadImage(image_only=True)(p)
+        # def _load_to_cd_hw(p: str) -> np.ndarray:
+        #     plower = p.lower()
+        #     if plower.endswith((".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp")):
+        #         x = self.loader_tif(p)
+        #     elif plower.endswith(".dcm"):
+        #         x = self.loader_dcm(p)
+        #     else:
+        #         # fallback: autodetect
+        #         x = LoadImage(image_only=True)(p)
 
-            return x
+        #     return x
 
-        self.load = Lambda(func=_load_to_cd_hw)
+        # self.load = Lambda(func=_load_to_cd_hw)
+
+    def _load_image(self, p: str):
+        plower = p.lower()
+        if plower.endswith((".tif", ".tiff", ".png", ".jpg", ".jpeg", ".bmp")):
+            return self.loader_tif(p)
+        elif plower.endswith(".dcm"):
+            return self.loader_dcm(p)
+        return self.loader_fallback(p)
 
     def __len__(self):
         return len(self.items)
@@ -90,7 +99,8 @@ class FineTuningDictDataset(Dataset):
     def __getitem__(self, idx):
         img_path, score = self.items[idx]
 
-        image = self.load(img_path) 
+        # image = self.load(img_path) 
+        image = self._load_image(img_path)
 
         ## retrieve corresponding otsu crop
         minr, minc, maxr, maxc = self.otsu_crops[img_path]
@@ -309,29 +319,50 @@ if __name__ == '__main__':
 
     dest_folder_name = f'from_scratch_{train_images}_{args.network_model}'
     learning_rate = float(args.learning_rate)
+
+
+    # if args.file_path is not None:
+    #     optim = Adam(model.head.parameters(), lr=learning_rate, weight_decay=1e-4)
+    #     if args.finetune_backbone_lr_multiplier is not None:
+    #         # optim_backbone = Adam(model.resnet.parameters(), lr=learning_rate * args.finetune_backbone_lr_multiplier, weight_decay=1e-4)
+    #         optim_backbone = Adam(model.features.parameters(), lr=learning_rate * args.finetune_backbone_lr_multiplier, weight_decay=1e-4)
+    #     else:
+    #         optim_backbone = None
+    #     pretrained_model = args.file_path.split('/')[-1].split('.')[0]
+    #     dest_folder_name = f'finetuning_{pretrained_model}_{train_images}'
+        
+    # else:
+    #     optim = Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
+    #     # optim_backbone = None
+    #     if args.finetune_backbone_lr_multiplier is not None:
+    #         # TODO: problema , doppi gradienti (features sia in optim che in optim backbone)
+    #         # optim_backbone = Adam(model.resnet.parameters(), lr=learning_rate * args.finetune_backbone_lr_multiplier, weight_decay=1e-4)
+    #         optim_backbone = Adam(model.features.parameters(), lr=learning_rate * args.finetune_backbone_lr_multiplier, weight_decay=1e-4)
+    #     else:
+    #         optim_backbone = None
+
+    ## one optimizer
+    param_groups = []
     if args.file_path is not None:
-        optim = Adam(model.head.parameters(), lr=learning_rate, weight_decay=1e-4)
+        param_groups.append({"params": model.head.parameters(), "lr": learning_rate})
         if args.finetune_backbone_lr_multiplier is not None:
-            # optim_backbone = Adam(model.resnet.parameters(), lr=learning_rate * args.finetune_backbone_lr_multiplier, weight_decay=1e-4)
-            optim_backbone = Adam(model.features.parameters(), lr=learning_rate * args.finetune_backbone_lr_multiplier, weight_decay=1e-4)
-        else:
-            optim_backbone = None
+            param_groups.append({"params": model.features.parameters(), "lr": learning_rate * args.finetune_backbone_lr_multiplier})
         pretrained_model = args.file_path.split('/')[-1].split('.')[0]
         dest_folder_name = f'finetuning_{pretrained_model}_{train_images}'
-        
     else:
-        optim = Adam(model.parameters(), lr=learning_rate, weight_decay=1e-4)
-        # optim_backbone = None
         if args.finetune_backbone_lr_multiplier is not None:
-            # optim_backbone = Adam(model.resnet.parameters(), lr=learning_rate * args.finetune_backbone_lr_multiplier, weight_decay=1e-4)
-            optim_backbone = Adam(model.features.parameters(), lr=learning_rate * args.finetune_backbone_lr_multiplier, weight_decay=1e-4)
+            param_groups.append({"params": model.features.parameters(), "lr": learning_rate * args.finetune_backbone_lr_multiplier})
+            param_groups.append({"params": model.head.parameters(), "lr": learning_rate})
         else:
-            optim_backbone = None
+            param_groups.append({"params": model.parameters(), "lr": learning_rate})
 
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Trainable parameters: {trainable_params}")
+
+    optim = Adam(param_groups, weight_decay=1e-4)
         
     criterion = nn.MSELoss()
+    # criterion = nn.L1Loss()
 
     dest_folder = os.path.join(base_finetuned_folder, dest_folder_name)
     name_exp = dest_folder_name
@@ -343,10 +374,10 @@ if __name__ == '__main__':
     print("Destination folder: ", dest_folder)
 
     scheduler = StepLR(optim, step_size=n_epochs//3, gamma=0.5)
-    if optim_backbone is not None:
-        scheduler_backbone = StepLR(optim_backbone, step_size=n_epochs//3, gamma=0.5)
-    else:
-        scheduler_backbone = None
+    # if optim_backbone is not None:
+    #     scheduler_backbone = StepLR(optim_backbone, step_size=n_epochs//3, gamma=0.5)
+    # else:
+    #     scheduler_backbone = None
     # scheduler = CosineAnnealingLR(optim, T_max=n_epochs)  
 
     # COMET
@@ -393,9 +424,19 @@ if __name__ == '__main__':
             trace_func=print
         )
 
+    last_epoch = 0
+
     for epoch in tqdm(range(n_epochs)):
         model.train()
+
+        # Gestione del congelamento/scongelamento dinamico del backbone
+        if args.finetune_backbone_lr_multiplier is not None:
+            freeze_backbone = epoch < optim_backbone_freeze  # se l'epoca è minore di quella di freeze, allora backbone congelato
+            for p in model.features.parameters():
+                p.requires_grad = not freeze_backbone
+
         train_losses = []
+        last_epoch = epoch
         with tqdm(train_dataloader_finetuning, leave=False, desc="Training") as t:
             for x, y in t:
                 x = x.to(device)
@@ -405,16 +446,16 @@ if __name__ == '__main__':
                     x = x.repeat(1, 3, 1, 1)
 
                 optim.zero_grad()
-                if optim_backbone is not None and epoch >= optim_backbone_freeze:
-                    optim_backbone.zero_grad()
+                # if optim_backbone is not None and epoch >= optim_backbone_freeze:
+                #     optim_backbone.zero_grad()
                 y_pred = model(x)
                 # y_pred = torch.clamp(y_pred, 0, 4)  # gt scores are between 0 and 4
                 loss = criterion(y_pred, y.unsqueeze(1))
                 t.set_postfix(loss=loss.item())
                 loss.backward()
                 optim.step()
-                if optim_backbone is not None and epoch >= optim_backbone_freeze:
-                    optim_backbone.step()
+                # if optim_backbone is not None and epoch >= optim_backbone_freeze:
+                #     optim_backbone.step()
 
                 train_losses.append(loss.item())
         
@@ -449,7 +490,7 @@ if __name__ == '__main__':
         with tqdm(test_dataloader_finetuning, leave=False, desc="Test") as t:
             for batch in t:
                 # x, y, paths = batch
-                x, y, paths, = batch
+                x, y, paths = batch
                 x = x.to(device)
                 y = y.to(device)
 
@@ -464,7 +505,7 @@ if __name__ == '__main__':
                 test_losses.append(loss.item())
 
                 # Salva pred/gt nello stesso ordine
-                y_pred = torch.clamp(y_pred, 0, 4)  # gt scores are between 0 and 4
+                # y_pred = torch.clamp(y_pred, 0, 4)  # gt scores are between 0 and 4
 
                 y_pred_np = y_pred.squeeze(1).cpu().numpy()
                 y_np = y.cpu().numpy()
@@ -508,15 +549,15 @@ if __name__ == '__main__':
         # experiment.log_metric(f"{dist_type}_pearson", pr_corr, step=epoch)
 
         scheduler.step()  # should be every epoch
-        if scheduler_backbone is not None and epoch >= optim_backbone_freeze:
-            scheduler_backbone.step()  # should be every epoch
+        # if scheduler_backbone is not None and epoch >= optim_backbone_freeze:
+        #     scheduler_backbone.step()  # should be every epoch
     
     # test finale sul modello con la migliore validation test
     if os.path.exists(best_path):
+        print("Loading best model for final evaluation...")
         model.load_state_dict(torch.load(best_path, map_location=device))
     else:
         torch.save(model.state_dict(), best_path)
-        last_epoch = epoch
 
     model.eval()
     test_losses = []
@@ -540,7 +581,7 @@ if __name__ == '__main__':
             t.set_postfix(loss=loss.item())
             test_losses.append(loss.item())
 
-            y_pred = torch.clamp(y_pred, 0, 4)
+            # y_pred = torch.clamp(y_pred, 0, 4)
             all_predictions.append(y_pred.squeeze(1).cpu().numpy())
             all_targets.append(y.cpu().numpy())
             all_names.extend([os.path.basename(p) for p in paths])
