@@ -5,7 +5,6 @@ from torch.optim import Adam
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from argparse import ArgumentParser
 import torch
-from torch import nn
 # from pretraining import rescaling, random, TARGET_HW, random_patch_selection
 import numpy as np 
 import os 
@@ -18,14 +17,14 @@ import torchvision
 import re
 import random
 from functools import partial
-
-from pretraining_networks import Vgg16, SiameseRankIQA, Resnet18, Resnet18SiameseRankIQA, SqueezeNet1_1, SqueezeNet1_1SiameseRankIQA
+import torch.nn.functional as F
+from pretraining_networks import Vgg16, SiameseRankIQA, Resnet18, Resnet18SiameseRankIQA, SqueezeNet1_1, SqueezeNet1_1SiameseRankIQA, FeatureExtractorHook
 
 from distortions_utils.distortions import gaussian_blur, lens_blur, motion_blur, jpeg, impulse_noise, multiplicative_noise, \
                         jitter, non_eccentricity_patch, pixelate, quantization, \
                         high_sharpen, linear_contrast_change, non_linear_contrast_change
 
-from adaptive_margin import compute_severity, adaptive_ranking_loss
+from adaptive_margin import compute_severity, adaptive_ranking_loss # AdaptiveHighPassFFTLoss
 
 def set_global_seed(seed):
     random.seed(seed)
@@ -47,7 +46,7 @@ set_global_seed(base_seed)
 
 TARGET_HW = 224
 
-import torch.nn.functional as F
+
 
 def norm_min_max(x):
     x_min = torch.min(x)
@@ -70,25 +69,71 @@ def set_window_gpu(x, window_level=40, window_width=400):
 
     return x
 
+# def rescaling(wind, fix=None):
+#     if wind is not None:
+#         if fix is None: 
+#             window_levels = [30, 40, 50]
+#             window_widths = [300, 400, 500]
+#             wl_id = random.randrange(3)
+#             ww_id = random.randrange(3)
+#             # return set_window_gpu(window_level=window_levels[wl_id], window_width=window_widths[ww_id]), 'soft tissue windowing'
+#             return partial(
+#                 set_window_gpu,
+#                 window_level=window_levels[wl_id],
+#                 window_width=window_widths[ww_id]
+#             ), 'soft tissue windowing'
+#         else:
+#             # fix windowing for all
+#             # return set_window_gpu(), 'soft tissue windowing' 
+#             return partial(set_window_gpu), 'soft tissue windowing'
+#     else:
+#         return norm_min_max, 'min max'
+
 def rescaling(wind, fix=None):
+
     if wind is not None:
-        if fix is None: 
-            window_levels = [30, 40, 50]
-            window_widths = [300, 400, 500]
-            wl_id = random.randrange(3)
-            ww_id = random.randrange(3)
-            # return set_window_gpu(window_level=window_levels[wl_id], window_width=window_widths[ww_id]), 'soft tissue windowing'
-            return partial(
-                set_window_gpu,
-                window_level=window_levels[wl_id],
-                window_width=window_widths[ww_id]
-            ), 'soft tissue windowing'
+
+        if fix is None:
+
+            def random_window_pair(img1, img2):
+
+                wl = random.choice([30, 40, 50])
+                ww = random.choice([300, 400, 500])
+
+                img1 = set_window_gpu(
+                    img1,
+                    window_level=wl,
+                    window_width=ww
+                )
+
+                img2 = set_window_gpu(
+                    img2,
+                    window_level=wl,
+                    window_width=ww
+                )
+
+                return img1, img2
+
+            return random_window_pair, 'soft tissue windowing'
+
         else:
-            # fix windowing for all
-            # return set_window_gpu(), 'soft tissue windowing' 
-            return partial(set_window_gpu), 'soft tissue windowing'
+
+            def fixed_window_pair(img1, img2):
+                return (
+                    set_window_gpu(img1),
+                    set_window_gpu(img2)
+                )
+
+            return fixed_window_pair, 'soft tissue windowing'
     else:
-        return norm_min_max, 'min max'
+        def minmax_pair(img1, img2):
+
+            return (
+                norm_min_max(img1),
+                norm_min_max(img2)
+            )
+
+        return minmax_pair, 'min max'
 
 def random_patch_selection(h, w, crop_size=TARGET_HW):
 
@@ -200,15 +245,24 @@ distortion_functions = {
 #     return ((2 * y - 1) * (s_hat - s) > 0).float().mean()
 
 # CORRECTED
-def ranking_loss(s, s_hat, y, margin=0.5):  # y ...
+def ranking_loss(s, s_hat, y, margin=0.5, typ='hinge'):  # y ...
   
     diff = s - s_hat
     target = (1 - 2*y)
 
-    # loss = torch.clamp((target * diff) + margin, min=0)
-    loss = torch.nn.functional.softplus(target * diff)
+    if typ == 'hinge':
+        loss = torch.clamp((target * diff) + margin, min=0)
+    elif typ == 'softplus':
+        loss = torch.nn.functional.softplus(target * diff)
+    else:
+        raise ValueError("Unsupported loss type")
 
     return loss.mean()
+
+    # loss = torch.clamp((target * diff) + margin, min=0)
+    # loss = torch.nn.functional.softplus(target * diff)
+
+    # return loss.mean()
 
 # CORRECTED
 def ranking_accuracy(s, s_hat, y):
@@ -779,14 +833,15 @@ class RankIQADataset(Dataset):
             x_hat = x_hat.repeat(3, 1, 1)
             
         if self.rescaling_fn:
-            x = self.rescaling_fn(x)
-            x_hat = self.rescaling_fn(x_hat)
+            # x = self.rescaling_fn(x)
+            # x_hat = self.rescaling_fn(x_hat)
+            x, x_hat = self.rescaling_fn(x, x_hat)  # applico lo stesso rescaling ad entrambe le immagini 
             
         # return x, x_hat, torch.tensor(y, dtype=torch.float32), t
         return x, x_hat, torch.tensor(y, dtype=torch.float32), t, meta  # ADDED
 
 @torch.no_grad()
-def evaluate_detailed(model, loader, device, experiment, epoch, margin):
+def evaluate_detailed(model, loader, device, experiment, epoch, margin, typ):
     model.eval()
 
     # TODO: sistema
@@ -809,20 +864,30 @@ def evaluate_detailed(model, loader, device, experiment, epoch, margin):
         diff = s - s_hat
         target = (1 - 2 * y) 
 
-        ## hinge loss
-        # losses = torch.clamp(((2*y - 1) * diff) + margin, min=0)
-        # losses = torch.clamp((target * diff) + margin, min=0)  
+        if typ == 'hinge':
+            ## hinge loss
+            # losses = torch.clamp(((2*y - 1) * diff) + margin, min=0)
+            losses = torch.clamp((target * diff) + margin, min=0)  
+        elif typ == 'softplus':
+            ## softplus
+            losses = torch.nn.functional.softplus(target * diff)
+        elif typ == 'adaptive':
+            ## adaptive loss
+            alpha = 2.0
+            severity_i, severity_j = compute_severity(meta=meta, distortion_range=distortion_range, real_arts_levels=loader.dataset.base.arts_levels, real_streak_levels=loader.dataset.base.streak_levels, real_noise_levels=loader.dataset.base.noise_levels, device=device)
+            delta = torch.abs(severity_i - severity_j)
+            expo = alpha * delta * target * diff
+            losses = torch.log(1 + torch.exp(expo))
 
         ## soft
         # losses = torch.nn.functional.softplus(target * diff)
 
-        ## adaptive loss
-        alpha = 2.0
-        severity_i, severity_j = compute_severity(meta=meta, distortion_range=distortion_range, real_arts_levels=loader.dataset.base.arts_levels, real_streak_levels=loader.dataset.base.streak_levels, real_noise_levels=loader.dataset.base.noise_levels, device=device)
-        delta = torch.abs(severity_i - severity_j)
-        expo = alpha * delta * target * diff
-        losses = torch.log(1 + torch.exp(expo))
-
+        # ## adaptive loss
+        # alpha = 2.0
+        # severity_i, severity_j = compute_severity(meta=meta, distortion_range=distortion_range, real_arts_levels=loader.dataset.base.arts_levels, real_streak_levels=loader.dataset.base.streak_levels, real_noise_levels=loader.dataset.base.noise_levels, device=device)
+        # delta = torch.abs(severity_i - severity_j)
+        # expo = alpha * delta * target * diff
+        # losses = torch.log(1 + torch.exp(expo))
 
         # ## NEW
         # severity_i, severity_j = compute_severity(meta=meta, distortion_range=distortion_range, device=device)
@@ -870,6 +935,101 @@ def evaluate_detailed(model, loader, device, experiment, epoch, margin):
     experiment.log_metric("test_total_loss", avg_total_loss, step=epoch)
     return avg_total_acc, avg_total_loss
 
+
+## con FFT
+# @torch.no_grad()
+# def evaluate_detailed(model, loader, device, experiment, epoch, margin, fft_criterion, lambda_fft):
+#     model.eval()
+    
+#     # Dizionari per accumulare metriche divise per tipo
+#     metrics_by_type = {t: {'loss': [], 'acc': []} for t in loader.dataset.pair_types}
+    
+#     for x, x_hat, y, pair_types, meta in tqdm(loader, desc=f"Epoch {epoch+1} [Detailed Test]"):
+#         x, x_hat, y = x.to(device), x_hat.to(device), y.unsqueeze(1).to(device)
+        
+#         # Passaggio nel modello siamese
+#         # s, s_hat = model(x, x_hat)
+
+#         # Forward pass separato per non sovrascrivere l'hook
+#         s = model.scorer(x)
+#         feat_x = feature_hook.get_features()
+        
+#         s_hat = model.scorer(x_hat)
+#         feat_x_hat = feature_hook.get_features()
+        
+#         # Calcolo dell'Hinge Ranking Loss base (elemento per elemento del batch, senza .mean())
+#         diff = s - s_hat
+#         target = (1 - 2 * y) 
+#         # losses_rank = torch.clamp((target * diff) + margin, min=0)  # Shape: [B, 1]
+
+#         ## soft
+#         losses_rank = torch.nn.functional.softplus(target * diff)
+        
+#         # Calcolo dell'Accuracy
+#         accs = (-target * diff > 0).float()  # Shape: [B, 1]
+        
+#         ## SEZIONE FFT LOSS ##
+#         # Estrariamo le feature map intermedie per l'intero batch
+#         # feat_x = model.scorer.features(x)
+#         # feat_x_hat = model.scorer.features(x_hat)
+#         ######################
+
+#         # Distribuiamo i risultati nei bucket corretti
+#         for i, t in enumerate(pair_types):
+#             # 1. Recuperiamo la ranking loss di base per questa singola coppia
+#             single_loss = losses_rank[i].item()
+            
+#             ## SEZIONE FFT LOSS ##
+#             # Mappatura del tipo di coppia (t) per applicare la regola corretta
+#             # if t == 1:  # Sostituisci con la chiave reale del tuo dataset per FD vs Syn allineati
+#             #     alignment = 'FD_vs_Aligned'
+#             # elif t in [4, 5]:  # Chiavi reali per Syn vs Syn o Real vs Real allineati
+#             #     alignment = 'Intensity_Shift'
+#             # else:
+#             #     alignment = 'Disaligned'
+
+#             if t in ['fd_ld', 'fd_syn']:  # Sostituisci con i tuoi indici reali per FD vs LD, FD vs Syn, FD vs Real
+#                 alignment = 'FD_vs_Aligned'
+#             elif t in ['syn_syn', 'real_real']:  # Sostituisci con i tuoi indici reali per Syn vs Syn, Real vs Real
+#                 alignment = 'Intensity_Shift'
+#             else:
+#                 alignment = 'Disaligned' # fd_real
+            
+#             # Calcolo della FFT loss isolata sulla singola coppia [1, C, H, W]
+#             single_fft_loss, _, _, _ = fft_criterion(
+#                 feat_x[i:i+1], 
+#                 feat_x_hat[i:i+1], 
+#                 alignment
+#             )
+            
+#             # Combiniamo la loss di classificazione con la loss regolarizzatrice FFT
+#             total_single_loss = single_loss + (lambda_fft * single_fft_loss.item())
+#             ######################
+            
+#             # Salviamo nei bucket dei test
+#             metrics_by_type[t]['loss'].append(total_single_loss)
+#             metrics_by_type[t]['acc'].append(accs[i].item())
+
+#     # Logs finali invariati
+#     total_acc = []
+#     total_loss = []
+#     for t, results in metrics_by_type.items():
+#         avg_l = np.mean(results['loss'])
+#         avg_a = np.mean(results['acc'])
+
+#         total_acc.append(avg_a)
+#         total_loss.append(avg_l)
+        
+#         experiment.log_metric(f"test_{t}_loss", avg_l, step=epoch)
+#         experiment.log_metric(f"test_{t}_accuracy", avg_a, step=epoch)
+#         print(f"Type {t:10} | Loss: {avg_l:.4f} | Acc: {avg_a:.4f}")
+
+#     avg_total_acc = np.mean(total_acc)
+#     avg_total_loss = np.mean(total_loss)
+#     experiment.log_metric("test_total_accuracy", avg_total_acc, step=epoch)
+#     experiment.log_metric("test_total_loss", avg_total_loss, step=epoch)
+#     return avg_total_acc, avg_total_loss
+
 if __name__ == '__main__':
     parser = ArgumentParser()
     parser.add_argument('--n_epochs', dest="n_epochs",type=int, default=30, help='number of epochs for training')
@@ -896,19 +1056,24 @@ if __name__ == '__main__':
     parser.add_argument('--margin', dest="margin",  default=0.5, help='margin for ranking loss')
 
     parser.add_argument('--network_model', dest="network_model",  default='squeezenet1_1', help='specify the network to use. vgg16, resnet18')
-
     parser.add_argument('--crop_mode', dest="crop_mode",  default='same', help='same or random (compare same or different patches in the pair)')
+    parser.add_argument('--rank_loss_type', dest="rank_loss_type",  default='hinge', help='type of ranking loss to use. hinge, softplus')
+    parser.add_argument('--curriculum', dest="curriculum",  default=None, help='curriculum learning if 1')
 
     args = parser.parse_args()
 
     device = torch.device(f'cuda:{args.device_id}' if torch.cuda.is_available() else 'cpu')
 
-    base_pretrained_folder = './pretrained_models_NEW'
+    base_pretrained_folder = os.path.join('/Prove/Albisani/medrank_results/pretrained_models', args.network_model) # './pretrained_models_NEW'
     os.makedirs(base_pretrained_folder, exist_ok=True)
+
+    if args.name_exp is None:
+        name_exp = f'net_{args.network_model}_loss_{args.rank_loss_type}_imagenet_{args.imagenet_initialization}_bb_same_slice_{args.crop_mode}' # balanced batches, diff slice/patient
+
 
     save_file_name = args.file_path
     if save_file_name is None:
-        save_file_name = args.name_exp
+        save_file_name = name_exp
 
     print("Save file name: ", save_file_name)
 
@@ -924,7 +1089,7 @@ if __name__ == '__main__':
         # matplotlib.use('TkAgg')
         experiment = Experiment(project_name=args.name_proj)
 
-    experiment.set_name(args.name_exp)
+    experiment.set_name(name_exp)
     ek = experiment.get_key()
 
     ### log useful parameters for the experiment 
@@ -937,7 +1102,10 @@ if __name__ == '__main__':
         "fix_windowing": args.fix_windowing,
         "margin": float(args.margin),
         "imagenet_initialization": args.imagenet_initialization,
-        "crop_mode": args.crop_mode
+        "network_model": args.network_model,
+        "crop_mode": args.crop_mode,
+        "rank_loss_type": args.rank_loss_type,
+        "curriculum_learning": args.curriculum
     })
 
     # ##
@@ -947,12 +1115,36 @@ if __name__ == '__main__':
     if args.network_model == 'vgg16':
         vgg = Vgg16(imagenet=args.imagenet_initialization)
         model = SiameseRankIQA(vgg_model=vgg)
+
+        # target_layer = "scorer.features.features.4"
+        # fft_radius = 12
+
     elif args.network_model == 'resnet18':
         vgg = Resnet18(imagenet=args.imagenet_initialization)
         model = Resnet18SiameseRankIQA(vgg_model=vgg)
+
+        # target_layer = "scorer.features.layer1"
+        # fft_radius = 6
+
     elif args.network_model == 'squeezenet1_1':
         vgg = SqueezeNet1_1(imagenet=args.imagenet_initialization)
         model = SqueezeNet1_1SiameseRankIQA(vgg_model=vgg)
+
+        # target_layer = "scorer.features.features.4" 
+        # fft_radius = 8  # Regola il raggio in base alla visualizzazione dello script precedente
+
+    # # Scegli il layer corretto in base alla stringa dell'architettura
+    # if "squeezenet" in str(type(vgg)).lower():
+    #     # In SqueezeNet1_1, il blocco 'features.4' è l'uscita della prima Fire unit 
+    #     # ed è ottimo perché ha ancora una buona risoluzione spaziale
+    #     target_layer = "scorer.features.features.4" 
+    #     fft_radius = 8  # Regola il raggio in base alla visualizzazione dello script precedente
+    # elif "resnet" in str(type(vgg)).lower():
+    #     target_layer = "scorer.features.layer1"
+    #     fft_radius = 6
+    # elif "vgg" in str(type(vgg)).lower():
+    #     target_layer = "scorer.features.features.4"
+    #     fft_radius = 12
         
     model.to(device)
     
@@ -973,6 +1165,7 @@ if __name__ == '__main__':
     # pair_types = ["fd_ld", "fd_syn"]
     # pair_types = ["fd_syn", "syn_syn"]
     # pair_types = ["syn_syn"]
+    # pair_types = ["syn_syn", "real_real"]
 
     # Dataset
     generators = {
@@ -991,28 +1184,54 @@ if __name__ == '__main__':
     train_ds = RankIQADataset(base_train, generators, pair_types, rescaling_fn, cm=args.crop_mode)
     test_ds = RankIQADataset(base_test, generators, pair_types, rescaling_fn, cm=args.crop_mode)
 
-    # Samplers
-    # train_sampler = BalancedBatchSampler(len(train_ds), pair_types, int(args.batch_size))
+    if args.curriculum is not None: 
+        print("Curriculum learning")
 
+        train_schedule_inv = {
+            0:  ['real_real'],
+            10:  ['real_real', 'syn_syn'],
+            20:  ['real_real', 'syn_syn', 'fd_syn'],
+            23:  ['real_real', 'syn_syn', 'fd_syn', 'fd_real'],
+            25:  ['real_real', 'syn_syn', 'fd_syn', 'fd_real', 'fd_ld'],
+        }
+
+        train_sampler = CurriculumBalancedBatchSampler(
+            dataset_len=len(train_ds),
+            schedule=train_schedule_inv,  # train_schedule
+            batch_size=int(args.batch_size)
+        )
+    else:
+
+        # Samplers
+        train_sampler = BalancedBatchSampler(len(train_ds), pair_types, int(args.batch_size))
+
+    ## curriculum learning 
     # train_schedule = {
     #     0:  ['fd_vs_syn_heavy'],
     #     3:  ['fd_vs_syn_heavy', 'fd_vs_syn_all'],
     #     6:  ['fd_vs_syn_heavy', 'fd_vs_syn_all', 'syn_vs_syn_distant'],
     #     9:  ['fd_vs_syn_heavy', 'fd_vs_syn_all', 'syn_vs_syn_distant', 'syn_vs_syn_close']
     # }
-    train_schedule = {
-        0:  ['fd_ld'],
-        3:  ['fd_ld', 'fd_real'],
-        7:  ['fd_ld', 'fd_real', 'fd_syn'],
-        10:  ['fd_ld', 'fd_real', 'fd_syn', 'syn_syn'],
-        13:  ['fd_ld', 'fd_real', 'fd_syn', 'syn_syn', 'real_real'],
-    }
+    # train_schedule = {
+    #     0:  ['fd_ld'],
+    #     3:  ['fd_ld', 'fd_real'],
+    #     7:  ['fd_ld', 'fd_real', 'fd_syn'],
+    #     10:  ['fd_ld', 'fd_real', 'fd_syn', 'syn_syn'],
+    #     13:  ['fd_ld', 'fd_real', 'fd_syn', 'syn_syn', 'real_real'],
+    # }
+    # train_schedule_inv = {
+    #     0:  ['real_real'],
+    #     10:  ['real_real', 'syn_syn'],
+    #     20:  ['real_real', 'syn_syn', 'fd_syn'],
+    #     23:  ['real_real', 'syn_syn', 'fd_syn', 'fd_real'],
+    #     25:  ['real_real', 'syn_syn', 'fd_syn', 'fd_real', 'fd_ld'],
+    # }
 
-    train_sampler = CurriculumBalancedBatchSampler(
-        dataset_len=len(train_ds),
-        schedule=train_schedule,
-        batch_size=int(args.batch_size)
-    )
+    # train_sampler = CurriculumBalancedBatchSampler(
+    #     dataset_len=len(train_ds),
+    #     schedule=train_schedule_inv,  # train_schedule
+    #     batch_size=int(args.batch_size)
+    # )
 
     # test - campionamento bilanciato o random...
     test_sampler = BalancedBatchSampler(len(test_ds), pair_types, int(args.batch_size))
@@ -1022,6 +1241,14 @@ if __name__ == '__main__':
     
     test_loader = DataLoader(test_ds, batch_sampler=test_sampler, num_workers=4, pin_memory=True)
 
+    ### fft loss
+    # fft_criterion = AdaptiveHighPassFFTLoss(radius=fft_radius)
+    # lambda_fft = 0.3 # Peso della FFT loss rispetto alla ranking loss
+
+    # # Attacchiamo l'estrattore hook al modello siamese sul layer scelto
+    # feature_hook = FeatureExtractorHook(model, target_layer)
+    # # ----------------------------------
+
     for epoch in range(args.n_epochs):
 
         model.train()
@@ -1029,8 +1256,9 @@ if __name__ == '__main__':
 
         with tqdm(train_loader, leave=False, desc="Training") as t:
 
-            # Riconfigura il bilanciamento interno del batch all'inizio di ogni epoca
-            train_loader.batch_sampler.set_epoch(epoch)
+            if args.curriculum_learning is not None:
+                # curriculum - riconfigura il bilanciamento interno del batch all'inizio di ogni epoca
+                train_loader.batch_sampler.set_epoch(epoch)
 
             # for x, x_hat, y, pair_types in t:
             for x, x_hat, y, pair_types, meta in t:
@@ -1039,13 +1267,62 @@ if __name__ == '__main__':
                 optim.zero_grad()
                 s, s_hat = model(x, x_hat) # B, 1 and B,1
 
-                # loss = ranking_loss(s, s_hat, y, margin=float(args.margin))
+                # Forward pass separato per non sovrascrivere l'hook
+                # s = model.scorer(x)
+                # # feat_x = feature_hook.get_features()
+                
+                # s_hat = model.scorer(x_hat)
+                # feat_x_hat = feature_hook.get_features()
 
-                ## NEW
-                severity_i, severity_j = compute_severity(meta=meta, distortion_range=distortion_range, real_arts_levels=train_loader.dataset.base.arts_levels, real_streak_levels=train_loader.dataset.base.streak_levels, real_noise_levels=train_loader.dataset.base.noise_levels, device=device)
-                loss = adaptive_ranking_loss(s, s_hat, y, severity_i, severity_j)
+                if args.rank_loss_type == 'hinge' or args.rank_loss_type == 'softplus':
+                    loss = ranking_loss(s, s_hat, y, margin=float(args.margin), typ=args.rank_loss_type)
+                elif args.rank_loss_type == 'adaptive':
+                    severity_i, severity_j = compute_severity(meta=meta, distortion_range=distortion_range, real_arts_levels=train_loader.dataset.base.arts_levels, real_streak_levels=train_loader.dataset.base.streak_levels, real_noise_levels=train_loader.dataset.base.noise_levels, device=device)
+                    loss = adaptive_ranking_loss(s, s_hat, y, severity_i, severity_j)
+
+                # ## NEW
+                # severity_i, severity_j = compute_severity(meta=meta, distortion_range=distortion_range, real_arts_levels=train_loader.dataset.base.arts_levels, real_streak_levels=train_loader.dataset.base.streak_levels, real_noise_levels=train_loader.dataset.base.noise_levels, device=device)
+                # loss = adaptive_ranking_loss(s, s_hat, y, severity_i, severity_j)
 
                 # t.set_postfix(loss=loss.item())
+
+                # loss_rank = ranking_loss(s, s_hat, y, margin=float(args.margin), typ=args.rank_loss_type)
+
+                # ## SEZIONE FFT LOSS ##
+                # # Recuperiamo le feature map intercettate dall'hook durante il forward pass di 'x' e 'x_hat'
+                # # Poiché il modello chiama scorer(x) e poi scorer(x_hat) in sequenza, l'hook
+                # # mantiene in memoria l'ultima passata (x_hat). Per prenderle entrambe in modo pulito ed efficiente:
+                
+                # # Calcoliamo la FFT loss per ogni elemento del batch in base al tipo di coppia
+                # fft_losses_batch = []
+                # for idx in range(x.size(0)):
+                #     # Estraiamo il tipo di coppia per il singolo elemento del batch
+                #     c_type = pair_types[idx].item() if torch.is_tensor(pair_types) else pair_types[idx]
+                    
+                #     # Mappatura dei tuoi 5 tipi di coppie (Modificala in base ai tuoi indici reali)
+                #     # if c_type == 1: # es. FD vs Syn allineati
+                #     #     alignment = 'FD_vs_Aligned'
+                #     # elif c_type in [4, 5]: # es. Syn vs Syn, Real vs Real allineati
+                #     #     alignment = 'Intensity_Shift'
+                #     # else: # Casi disallineati (es. FD vs Real)
+                #     #     alignment = 'Disaligned'
+
+                #     if c_type in ['fd_ld', 'fd_syn']:  # Sostituisci con i tuoi indici reali per FD vs LD, FD vs Syn, FD vs Real
+                #         alignment = 'FD_vs_Aligned'
+                #     elif c_type in ['syn_syn', 'real_real']:  # Sostituisci con i tuoi indici reali per Syn vs Syn, Real vs Real
+                #         alignment = 'Intensity_Shift'
+                #     else:
+                #         alignment = 'Disaligned' # fd_real 
+                    
+                #     # Calcolo della singola loss sulla feature map [1, C, H, W]
+                #     item_loss, _, _, _ = fft_criterion(feat_x[idx:idx+1], feat_x_hat[idx:idx+1], alignment)
+                #     fft_losses_batch.append(item_loss)
+                    
+                # loss_fft = torch.stack(fft_losses_batch).mean()
+                
+                # # 3. Bilanciamento delle Loss
+                # loss = loss_rank + (lambda_fft * loss_fft)
+                # ######################
 
                 with torch.no_grad():
                     s_mean = s.mean().item()
@@ -1056,8 +1333,18 @@ if __name__ == '__main__':
                     acc = ranking_accuracy(s, s_hat, y).item()
 
                 # Aggiorna la barra tqdm mostrando loss, accuracy e scala dei punteggi
+                # t.set_postfix(
+                #     loss=f"{loss.item():.4f}",
+                #     acc=f"{acc:.2f}",
+                #     s_avg=f"{s_mean:.2f}",
+                #     sh_avg=f"{sh_mean:.2f}",
+                #     s_bounds=f"[{s_min:.1f},{s_max:.1f}]"
+                # )
+
                 t.set_postfix(
                     loss=f"{loss.item():.4f}",
+                    # loss_rank=f"{loss_rank.item():.4f}",
+                    # l_fft=f"{loss_fft.item():.4f}", # Per monitorare se sta scendendo
                     acc=f"{acc:.2f}",
                     s_avg=f"{s_mean:.2f}",
                     sh_avg=f"{sh_mean:.2f}",
@@ -1074,7 +1361,17 @@ if __name__ == '__main__':
         experiment.log_metric("train_loss", train_loss_mean, step=epoch)
 
         ## test
-        evaluate_detailed(model, test_loader, device, experiment, epoch, float(args.margin))
+        evaluate_detailed(model, test_loader, device, experiment, epoch, float(args.margin), typ=args.rank_loss_type)
+        # evaluate_detailed(
+        #     model, 
+        #     test_loader, 
+        #     device, 
+        #     experiment, 
+        #     epoch, 
+        #     float(args.margin), 
+        #     fft_criterion=fft_criterion,  # Passiamo il criterio FFT
+        #     lambda_fft=lambda_fft         # Passiamo il peso lambda
+        # )
 
 
     torch.save(model.state_dict(), os.path.join(base_pretrained_folder, save_file_name + '.pth')) # per salvare il modello

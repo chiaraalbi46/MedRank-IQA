@@ -3,7 +3,6 @@ from torch.optim import Adam
 from torch.utils.data import Dataset, DataLoader, ConcatDataset
 from argparse import ArgumentParser
 import torch
-from torch import nn
 # from pretraining import rescaling, random, TARGET_HW, random_patch_selection
 import numpy as np 
 import os 
@@ -16,9 +15,8 @@ import torchvision
 import re
 import random
 from functools import partial
+import torch.nn.functional as F
 
-from adaptive_margin import adaptive_ranking_loss
-from adaptive_margin import adaptive_ranking_loss
 from pretraining_networks import Vgg16, SiameseRankIQA, Resnet18, Resnet18SiameseRankIQA, SqueezeNet1_1, SqueezeNet1_1SiameseRankIQA
 
 from distortions_utils.distortions import gaussian_blur, lens_blur, motion_blur, jpeg, impulse_noise, multiplicative_noise, \
@@ -52,8 +50,6 @@ TARGET_HW = 224
 # g_test = torch.Generator()
 # g_test.manual_seed(base_seed + 1)
 
-import torch.nn.functional as F
-
 def norm_min_max(x):
     x_min = torch.min(x)
     x_max = torch.max(x)
@@ -75,25 +71,71 @@ def set_window_gpu(x, window_level=40, window_width=400):
 
     return x
 
+# def rescaling(wind, fix=None):
+#     if wind is not None:
+#         if fix is None: 
+#             window_levels = [30, 40, 50]
+#             window_widths = [300, 400, 500]
+#             wl_id = random.randrange(3)
+#             ww_id = random.randrange(3)
+#             # return set_window_gpu(window_level=window_levels[wl_id], window_width=window_widths[ww_id]), 'soft tissue windowing'
+#             return partial(
+#                 set_window_gpu,
+#                 window_level=window_levels[wl_id],
+#                 window_width=window_widths[ww_id]
+#             ), 'soft tissue windowing'
+#         else:
+#             # fix windowing for all
+#             # return set_window_gpu(), 'soft tissue windowing' 
+#             return partial(set_window_gpu), 'soft tissue windowing'
+#     else:
+#         return norm_min_max, 'min max'
+
 def rescaling(wind, fix=None):
+
     if wind is not None:
-        if fix is None: 
-            window_levels = [30, 40, 50]
-            window_widths = [300, 400, 500]
-            wl_id = random.randrange(3)
-            ww_id = random.randrange(3)
-            # return set_window_gpu(window_level=window_levels[wl_id], window_width=window_widths[ww_id]), 'soft tissue windowing'
-            return partial(
-                set_window_gpu,
-                window_level=window_levels[wl_id],
-                window_width=window_widths[ww_id]
-            ), 'soft tissue windowing'
+
+        if fix is None:
+
+            def random_window_pair(img1, img2):
+
+                wl = random.choice([30, 40, 50])
+                ww = random.choice([300, 400, 500])
+
+                img1 = set_window_gpu(
+                    img1,
+                    window_level=wl,
+                    window_width=ww
+                )
+
+                img2 = set_window_gpu(
+                    img2,
+                    window_level=wl,
+                    window_width=ww
+                )
+
+                return img1, img2
+
+            return random_window_pair, 'soft tissue windowing'
+
         else:
-            # fix windowing for all
-            # return set_window_gpu(), 'soft tissue windowing' 
-            return partial(set_window_gpu), 'soft tissue windowing'
+
+            def fixed_window_pair(img1, img2):
+                return (
+                    set_window_gpu(img1),
+                    set_window_gpu(img2)
+                )
+
+            return fixed_window_pair, 'soft tissue windowing'
     else:
-        return norm_min_max, 'min max'
+        def minmax_pair(img1, img2):
+
+            return (
+                norm_min_max(img1),
+                norm_min_max(img2)
+            )
+
+        return minmax_pair, 'min max'
 
 def random_patch_selection(h, w, crop_size=TARGET_HW):
 
@@ -101,9 +143,6 @@ def random_patch_selection(h, w, crop_size=TARGET_HW):
     left = random.randrange(0, max(1, w - crop_size))
 
     return top, left
-
-
-import torch.nn.functional as F
 
 def ensure_224(x):
     _, h, w = x.shape
@@ -149,7 +188,8 @@ distortion_range = {
     "quantization": [20, 16, 13, 10, 7],
     # "colorblock": [2, 4, 6, 8, 10],
     "highsharpen": [1, 2, 3, 6, 12],
-    "lincontrchange": [0., 0.15, -0.4, 0.3, -0.6],
+    # "lincontrchange": [0., 0.15, -0.4, 0.3, -0.6],
+    "lincontrchange": [-0.6, -0.4, 0., 0.15,  0.3],  # crescente
     "nonlincontrchange": [0.4, 0.3, 0.2, 0.1, 0.05],
 }
 
@@ -198,127 +238,6 @@ distortion_functions = {
     "nonlincontrchange": non_linear_contrast_change,
 }
 
-# class Vgg16(nn.Module):
-#     def __init__(self, imagenet=None):
-#         super(Vgg16, self).__init__()
-
-#         if imagenet is not None:
-#             print("QUIIIII")
-#             model = vgg16(weights=VGG16_Weights.IMAGENET1K_V1)
-
-#             # cambia primo layer per input 1 canale
-#             # old_conv = model.features[0]
-#             # model.features[0] = nn.Conv2d(
-#             #     1,
-#             #     old_conv.out_channels,
-#             #     kernel_size=old_conv.kernel_size,
-#             #     stride=old_conv.stride,
-#             #     padding=old_conv.padding
-#             # )
-
-#             # # inizializza pesi facendo la media dei canali RGB
-#             # with torch.no_grad():
-#             #     model.features[0].weight[:] = old_conv.weight.mean(dim=1, keepdim=True)
-#         else:
-#             model = torchvision.models.vgg16(pretrained=False, num_classes=1)  # original code (for loading pretrained model on natural images)
-
-#             # model.features[0] = nn.Conv2d(
-#             #     1, 64, kernel_size=3, stride=1, padding=1
-#             # )
-
-#         self.features = torch.nn.Sequential(
-#             collections.OrderedDict(
-#                 zip(
-#                     [
-#                         'conv1_1', 'relu1_1', 'conv1_2', 'relu1_2', 'pool1',
-#                         'conv2_1', 'relu2_1', 'conv2_2', 'relu2_2', 'pool2',
-#                         'conv3_1', 'relu3_1', 'conv3_2', 'relu3_2', 'conv3_3', 'relu3_3', 'pool3',
-#                         'conv4_1', 'relu4_1', 'conv4_2', 'relu4_2', 'conv4_3', 'relu4_3', 'pool4',
-#                         'conv5_1', 'relu5_1', 'conv5_2', 'relu5_2', 'conv5_3', 'relu5_3', 'pool5'
-#                     ],
-#                     model.features
-#                 )
-#             )
-#         )
-
-#         self.classifier = torch.nn.Sequential(
-#             collections.OrderedDict(
-#                 zip(
-#                     ['fc6_m', 'relu6_m', 'drop6_m', 'fc7_m', 'relu7_m', 'drop7_m', 'fc8_m'],
-#                     model.classifier
-#                 )
-#             )
-#         )
-#         if imagenet is not None:
-#             self.classifier.fc8_m = nn.Linear(4096, 1)  
-
-#     def load_model(self, file, debug: bool = False):
-#         """
-#         Load model file.
-
-#         :param file: the model file to load.
-#         :param debug: indicate if output the debug info.
-#         """
-#         state_dict = torch.load(file)
-
-#         dict_to_load = dict()
-#         for k, v in state_dict.items():  # "v" is parameter and "k" is its name
-#             for l, p in self.named_parameters():  # "p" is parameter and "l" is its name
-#                 # use parameter's name to match state_dict's params and model's params
-#                 split_k, split_l = k.split('.'), l.split('.')
-#                 if (split_k[0] in split_l[1]) and (split_k[1] == split_l[2]):
-#                     dict_to_load[l] = torch.from_numpy(np.array(v)).view_as(p)
-#                     if debug:  # output debug info
-#                         print(f"match: {split_k} and {split_l}.")
-
-#         self.load_state_dict(dict_to_load)
-
-#     def forward(self, x):
-#         out = self.features(x)
-#         out = torch.flatten(out, start_dim=1, end_dim=-1)  # dont use adaptive avg pooling
-#         out = self.classifier(out)
-#         return out
-
-# class VGGFeatureExtractor(nn.Module):
-#     def __init__(self, vgg):
-#         super().__init__()
-#         self.features = vgg.features
-
-#     def forward(self, x):
-#         f = self.features(x)              # [B, 512, H, W]
-#         return f
-
-# class RankIQA_branch(nn.Module):
-#     def __init__(self, vgg_model):
-#         super().__init__()
-#         self.features = VGGFeatureExtractor(vgg_model)  # conv layers of VGG16
-        
-#         self.head = nn.Sequential(
-#             nn.Flatten(),
-#             nn.Linear(512 * 7 * 7, 4096),
-#             nn.ReLU(inplace=True),
-#             nn.Dropout(0.5),
-#             nn.Linear(4096, 4096),
-#             nn.ReLU(inplace=True),
-#             nn.Dropout(0.5),
-#             nn.Linear(4096, 1)  # scalar score
-#         )
-
-#     def forward(self, x):
-#         feats = self.features(x)
-#         score = self.head(feats)
-#         return score
-
-# class SiameseRankIQA(nn.Module):
-#     def __init__(self, vgg_model):
-#         super().__init__()
-#         self.scorer = RankIQA_branch(vgg_model)
-
-#     def forward(self, x, x_hat):
-#         s = self.scorer(x)
-#         s_hat = self.scorer(x_hat)
-#         return s, s_hat
-
 # def ranking_loss(s, s_hat, y, margin=0.5):  # y ...
 #     # y = 0 --> s > s_hat
 
@@ -340,13 +259,20 @@ distortion_functions = {
 #     return ((2 * y - 1) * (s_hat - s) > 0).float().mean()
 
 # CORRECTED
-def ranking_loss(s, s_hat, y, margin=0.5):  # y ...
+def ranking_loss(s, s_hat, y, margin=0.5, typ='hinge'):  # y ...
   
     diff = s - s_hat
     target = (1 - 2*y)
 
+    if typ == 'hinge':
+        loss = torch.clamp((target * diff) + margin, min=0)
+    elif typ == 'softplus':
+        loss = torch.nn.functional.softplus(target * diff)
+    else:
+        raise ValueError("Unsupported loss type")
+
     # loss = torch.clamp((target * diff) + margin, min=0)
-    loss = torch.nn.functional.softplus(target * diff)
+    # loss = torch.nn.functional.softplus(target * diff)
 
     return loss.mean()
 
@@ -607,6 +533,58 @@ class BalancedBatchSampler(torch.utils.data.Sampler):
     def __len__(self):
         return self.num_batches
 
+#### curriculum batch sampler 
+class CurriculumBalancedBatchSampler(torch.utils.data.Sampler):
+    def __init__(self, dataset_len, schedule, batch_size):
+        """
+        dataset_len: int -> lunghezza del dataset di base
+        schedule: dict -> {epoca: [lista_tipi_coppia_attivi]}
+                           es: {0: ['fd_vs_syn'], 5: ['fd_vs_syn', 'syn_vs_syn_easy'], 10: all}
+        batch_size: int -> dimensione finale desiderata del batch (es. 120)
+        """
+        self.dataset_len = dataset_len
+        self.schedule = schedule
+        self.batch_size = batch_size
+        self.num_batches = dataset_len // batch_size
+        
+        # Inizializzazione allo stato dell'epoca 0
+        self.epoch = 0
+        self._update_active_types()
+
+    def _update_active_types(self):
+        # Determina quali tipi di coppie sono attivi per l'epoca corrente
+        milestones = sorted([k for k in self.schedule.keys() if k <= self.epoch])
+        latest_milestone = milestones[-1]
+        self.active_pair_types = self.schedule[latest_milestone]
+        
+        # Bilancia dinamicamente il batch in base a quanti tipi sono attivi
+        num_active = len(self.active_pair_types)
+        assert self.batch_size % num_active == 0, \
+            f"Errore: batch_size ({self.batch_size}) non divisibile per il numero di coppie attive ({num_active}) all'epoca {self.epoch}"
+        
+        self.per_type = self.batch_size // num_active
+        print(f"\n[Curriculum] Epoca {self.epoch} -> Tipi Attivi: {self.active_pair_types} | Esempi per tipo nel batch: {self.per_type}")
+
+    def set_epoch(self, epoch):
+        """Metodo da chiamare all'inizio di ogni epoca nel loop di training"""
+        self.epoch = epoch
+        self._update_active_types()
+
+    def __iter__(self):
+        for _ in range(self.num_batches):
+            batch = []
+            # Campiona solo dai tipi attivi in questa epoca
+            for t in self.active_pair_types:
+                for _ in range(self.per_type):
+                    idx = random.randint(0, self.dataset_len - 1)
+                    batch.append((idx, t))
+
+            # Rimescola l'ordine interno del batch per non avere tutte le coppie dello stesso tipo vicine
+            random.shuffle(batch)
+            yield batch
+
+    def __len__(self):
+        return self.num_batches
 class PairGenerator:
     def __call__(self, dataset, idx):
         raise NotImplementedError
@@ -894,14 +872,15 @@ class RankIQADataset(Dataset):
             x_hat = x_hat.repeat(3, 1, 1)
             
         if self.rescaling_fn:
-            x = self.rescaling_fn(x)
-            x_hat = self.rescaling_fn(x_hat)
+            # x = self.rescaling_fn(x)
+            # x_hat = self.rescaling_fn(x_hat)
+            x, x_hat = self.rescaling_fn(x, x_hat)  # applico lo stesso rescaling ad entrambe le immagini 
             
         # return x, x_hat, torch.tensor(y, dtype=torch.float32), t
         return x, x_hat, torch.tensor(y, dtype=torch.float32), t, meta
 
 @torch.no_grad()
-def evaluate_detailed(model, loader, device, experiment, epoch, margin):
+def evaluate_detailed(model, loader, device, experiment, epoch, margin, typ):
     model.eval()
     
     # Dizionari per accumulare metriche divise per tipo
@@ -918,11 +897,26 @@ def evaluate_detailed(model, loader, device, experiment, epoch, margin):
         diff = s - s_hat
         target = (1 - 2 * y) 
 
+        if typ == 'hinge':
+            ## hinge loss
+            # losses = torch.clamp(((2*y - 1) * diff) + margin, min=0)
+            losses = torch.clamp((target * diff) + margin, min=0)  
+        elif typ == 'softplus':
+            ## softplus
+            losses = torch.nn.functional.softplus(target * diff)
+        elif typ == 'adaptive':
+            ## adaptive loss
+            alpha = 2.0
+            severity_i, severity_j = compute_severity(meta=meta, distortion_range=distortion_range, real_arts_levels=loader.dataset.base.arts_levels, real_streak_levels=loader.dataset.base.streak_levels, real_noise_levels=loader.dataset.base.noise_levels, device=device)
+            delta = torch.abs(severity_i - severity_j)
+            expo = alpha * delta * target * diff
+            losses = torch.log(1 + torch.exp(expo))
+
         # hinge loss
         # losses = torch.clamp((target * diff) + margin, min=0)
 
         # soft
-        losses = torch.nn.functional.softplus(target * diff)
+        # losses = torch.nn.functional.softplus(target * diff)
 
         # # adaptive logistic loss
         # alpha = 2.0
@@ -984,18 +978,23 @@ if __name__ == '__main__':
     parser.add_argument('--margin', dest="margin",  default=0.5, help='margin for ranking loss')
 
     parser.add_argument('--network_model', dest="network_model",  default='vgg16', help='specify the network to use. vgg16, resnet18')
-    parser.add_argument('--crop_mode', dest="crop_mode",  default='same', help='same or random (compare same or different patches in the pair)')
+    parser.add_argument('--crop_mode', dest="crop_mode",  default='random', help='same or random (compare same or different patches in the pair)')
+    parser.add_argument('--rank_loss_type', dest="rank_loss_type",  default='hinge', help='type of ranking loss to use. hinge, softplus')
+    parser.add_argument('--curriculum', dest="curriculum",  default=None, help='curriculum learning if 1')
 
     args = parser.parse_args()
 
     device = torch.device(f'cuda:{args.device_id}' if torch.cuda.is_available() else 'cpu')
 
-    base_pretrained_folder = './pretrained_models_NEW'
+    base_pretrained_folder = os.path.join('/Prove/Albisani/medrank_results/pretrained_models', args.network_model) # './pretrained_models_NEW'
     os.makedirs(base_pretrained_folder, exist_ok=True)
+
+    if args.name_exp is None:
+        name_exp = f'net_{args.network_model}_loss_{args.rank_loss_type}_imagenet_{args.imagenet_initialization}_bb_diff_slice_{args.crop_mode}' # balanced batches, diff slice/patient
 
     save_file_name = args.file_path
     if save_file_name is None:
-        save_file_name = args.name_exp
+        save_file_name = name_exp
 
     print("Save file name: ", save_file_name)
 
@@ -1011,7 +1010,7 @@ if __name__ == '__main__':
         # matplotlib.use('TkAgg')
         experiment = Experiment(project_name=args.name_proj)
 
-    experiment.set_name(args.name_exp)
+    experiment.set_name(name_exp)
     ek = experiment.get_key()
 
     ### log useful parameters for the experiment 
@@ -1024,7 +1023,10 @@ if __name__ == '__main__':
         "fix_windowing": args.fix_windowing,
         "margin": float(args.margin),
         "imagenet_initialization": args.imagenet_initialization,
-        "crop_mode": args.crop_mode
+        "network_model": args.network_model,
+        "crop_mode": args.crop_mode,
+        "rank_loss_type": args.rank_loss_type,
+        "curriculum_learning": args.curriculum
     })
 
     # ##
@@ -1074,8 +1076,29 @@ if __name__ == '__main__':
     train_ds = RankIQADataset(base_train, generators, pair_types, rescaling_fn, cm=args.crop_mode)
     test_ds = RankIQADataset(base_test, generators, pair_types, rescaling_fn, cm=args.crop_mode)
 
+    if args.curriculum is not None: 
+        print("Curriculum learning")
+
+        train_schedule_inv = {
+            0:  ['real_real'],
+            10:  ['real_real', 'syn_syn'],
+            20:  ['real_real', 'syn_syn', 'fd_syn'],
+            23:  ['real_real', 'syn_syn', 'fd_syn', 'fd_real'],
+            25:  ['real_real', 'syn_syn', 'fd_syn', 'fd_real', 'fd_ld'],
+        }
+
+        train_sampler = CurriculumBalancedBatchSampler(
+            dataset_len=len(train_ds),
+            schedule=train_schedule_inv,  # train_schedule
+            batch_size=int(args.batch_size)
+        )
+    else:
+
+        # Samplers
+        train_sampler = BalancedBatchSampler(len(train_ds), pair_types, int(args.batch_size))
+
     # Samplers
-    train_sampler = BalancedBatchSampler(len(train_ds), pair_types, int(args.batch_size))
+    # train_sampler = BalancedBatchSampler(len(train_ds), pair_types, int(args.batch_size))
     # test - campionamento bilanciato o random...
     test_sampler = BalancedBatchSampler(len(test_ds), pair_types, int(args.batch_size))
 
@@ -1090,6 +1113,9 @@ if __name__ == '__main__':
         train_losses = []
 
         with tqdm(train_loader, leave=False, desc="Training") as t:
+            if args.curriculum_learning is not None:
+                # curriculum - riconfigura il bilanciamento interno del batch all'inizio di ogni epoca
+                train_loader.batch_sampler.set_epoch(epoch)
             # for x, x_hat, y, pair_types in t:
             for x, x_hat, y, pair_types, meta in t:
                 x, x_hat, y = x.to(device), x_hat.to(device), y.unsqueeze(1).to(device)  # y è B --> lo rendo B, 1
@@ -1097,7 +1123,13 @@ if __name__ == '__main__':
                 optim.zero_grad()
                 s, s_hat = model(x, x_hat) # B, 1 and B,1
 
-                loss = ranking_loss(s, s_hat, y, margin=float(args.margin))
+                if args.rank_loss_type == 'hinge' or args.rank_loss_type == 'softplus':
+                    loss = ranking_loss(s, s_hat, y, margin=float(args.margin), typ=args.rank_loss_type)
+                elif args.rank_loss_type == 'adaptive':
+                    severity_i, severity_j = compute_severity(meta=meta, distortion_range=distortion_range, real_arts_levels=train_loader.dataset.base.arts_levels, real_streak_levels=train_loader.dataset.base.streak_levels, real_noise_levels=train_loader.dataset.base.noise_levels, device=device)
+                    loss = adaptive_ranking_loss(s, s_hat, y, severity_i, severity_j)
+
+                # loss = ranking_loss(s, s_hat, y, margin=float(args.margin))
 
                 # ## margine adattivo
                 # severity_i, severity_j = compute_severity(meta=meta, distortion_range=distortion_range, device=device)
@@ -1132,7 +1164,7 @@ if __name__ == '__main__':
         experiment.log_metric("train_loss", train_loss_mean, step=epoch)
 
         ## test
-        evaluate_detailed(model, test_loader, device, experiment, epoch, float(args.margin))
+        evaluate_detailed(model, test_loader, device, experiment, epoch, float(args.margin), typ=args.rank_loss_type)
         
         # model.eval()
         # test_accuracies = []
